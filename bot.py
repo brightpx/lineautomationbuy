@@ -296,6 +296,15 @@ async def proceed_to_checkout(page: Page, sizes: list[str]) -> tuple[bool, str]:
         if "/checkout/cart" in current_url:
             log.info("✓ ระบบเพิ่มสินค้าเข้าตะกร้าอัตโนมัติแล้ว — ข้ามขั้นตอนเลือกไซส์")
 
+            # รอให้หน้า checkout โหลดเสร็จก่อน
+            log.info("รอหน้า checkout โหลดเสร็จ...")
+            try:
+                await page.wait_for_load_state("domcontentloaded", timeout=10_000)
+                await page.wait_for_timeout(2000)  # รอเพิ่มให้หน้าโหลดเสร็จจริง ๆ
+                log.info("✓ หน้า checkout โหลดเสร็จแล้ว")
+            except Exception as e:
+                log.warning(f"⚠️  หน้า checkout อาจยังไม่โหลดเสร็จ: {e}")
+
             # ปิด popup ที่หน้า cart ทันที (LINE POINTS, โปรโมชั่น)
             log.info("ปิด popup ที่หน้า cart...")
             try:
@@ -624,99 +633,84 @@ async def select_promptpay(page: Page) -> bool:
         # ปิด popup/modal ที่หน้า checkout (LINE POINTS, LINE Pay, โปรโมชั่น)
         log.info("ตรวจสอบ popup ที่หน้า checkout...")
 
-        # รอให้ popup โหลดเสร็จก่อน (ถ้ามี)
-        await page.wait_for_timeout(1000)
-
-        # ลอง Escape key ก่อน (เร็วที่สุด)
-        for _ in range(3):
-            try:
-                await page.keyboard.press("Escape")
-                await page.wait_for_timeout(400)
-                log.info("✓ กด Escape เพื่อปิด popup")
-            except:
-                pass
+        # รอให้ popup โหลดเสร็จก่อน (ถ้ามี) — เพิ่มเวลารอ
+        await page.wait_for_timeout(2000)
 
         close_selectors = [
-            # ปุ่มปิด LINE POINTS popup โดยเฉพาะ — ลองทุกรูปแบบ
+            # ลอง click ที่ overlay/backdrop ของ popup (click นอก popup เพื่อปิด)
+            "[class*='overlay']",
+            "[class*='Overlay']",
+            "[class*='backdrop']",
+            "[class*='Backdrop']",
+            "[role='presentation']",
+            # ปุ่มปิด LINE POINTS popup โดยเฉพาะ
+            "div:has-text('Shop, earn, and use LINE POINTS!')",
             "button:has-text('Shop, earn, and use LINE POINTS!')",
             "button:has-text('LINE POINTS')",
-            "div:has-text('Shop, earn, and use LINE POINTS!')",
             "[role='button']:has-text('LINE POINTS')",
             "[role='button']:has-text('Shop')",
+            # ปุ่มปิดทั่วไป
             "button:has-text('Got it')",
             "button:has-text('รับทราบ')",
             "button:has-text('เข้าใจแล้ว')",
             "button:has-text('OK')",
             "button:has-text('Close')",
             "button:has-text('ปิด')",
-            "button:has-text('ไม่ใช้')",
-            "button:has-text('ไม่ใช้คะแนน')",
-            "button:has-text('ข้าม')",
-            "button:has-text('Skip')",
             "button:has-text('×')",
             "button:has-text('X')",
             "button:has-text('✕')",
             "[data-testid='campaign-close-button']",
             "[data-testid*='close']",
             "[data-testid*='dismiss']",
-            "[data-testid*='modal-close']",
-            "[data-testid*='popup-close']",
             "[aria-label*='close' i]",
-            "[aria-label*='Close' i]",
             "[aria-label*='ปิด' i]",
-            "[aria-label*='dismiss' i]",
             "button[class*='close' i]",
-            "button[class*='Close' i]",
             "[class*='modal'] button:has-text('×')",
-            "[class*='Modal'] button:has-text('×')",
-            "[class*='popup'] button:has-text('×')",
-            "[class*='dialog'] button:has-text('×')",
             "[role='dialog'] button:has-text('Close')",
             "[role='dialog'] button:has-text('ปิด')",
-            "[role='dialog'] button[aria-label*='close' i]",
-            # ลอง click ที่มุมบนขวาของ modal (ปกติปุ่มปิดอยู่ที่นี่)
-            "[class*='modal'] [class*='header'] button",
-            "[class*='Modal'] [class*='Header'] button",
             # ลองหา SVG icon ปิด
             "button:has(svg)",
             "[role='button']:has(svg)",
         ]
 
         popup_closed = False
-        for attempt in range(5):  # เพิ่มจาก 3 → 5 รอบ
+        for attempt in range(6):  # เพิ่มเป็น 6 รอบ
             if popup_closed:
                 break
 
             log.info(f"  ครั้งที่ {attempt + 1}: ค้นหา popup...")
+
+            # ลอง Escape key ก่อนทุกครั้ง
+            try:
+                await page.keyboard.press("Escape")
+                await page.wait_for_timeout(500)
+                log.info("  กด Escape")
+            except:
+                pass
+
             for selector in close_selectors:
                 try:
                     close_btn = page.locator(selector).first
-                    if await close_btn.is_visible(timeout=1000):  # เพิ่ม timeout จาก 800 → 1000
+                    if await close_btn.is_visible(timeout=1500):
                         btn_text = await close_btn.text_content() or ""
-                        await close_btn.click(timeout=2000, force=True)  # เพิ่ม timeout จาก 1500 → 2000
-                        log.info(f"✓ ปิด popup ด้วย selector: {selector} (text='{btn_text.strip()}')")
-                        await page.wait_for_timeout(800)  # เพิ่มจาก 500 → 800
+                        log.info(f"  พบ popup ด้วย selector: {selector} (text='{btn_text.strip()[:100]}...')")
+                        await close_btn.click(timeout=3000, force=True)
+                        log.info(f"  ✓ ปิด popup ด้วย selector: {selector}")
+                        await page.wait_for_timeout(1000)
                         popup_closed = True
                         break
                 except Exception as e:
                     continue
 
-            # ถ้ายังไม่ปิด ลอง Escape อีกครั้ง
-            if not popup_closed:
-                try:
-                    await page.keyboard.press("Escape")
-                    await page.wait_for_timeout(400)
-                    log.info("  กด Escape อีกครั้ง")
-                except:
-                    pass
+            if not popup_closed and attempt < 5:
+                await page.wait_for_timeout(1000)
 
-            if not popup_closed and attempt < 4:  # เปลี่ยนจาก < 2 → < 4
-                await page.wait_for_timeout(1000)  # เพิ่มจาก 800 → 1000
-
-        if not popup_closed:
-            log.warning("  ⚠️  ไม่พบ popup หรือปิดไม่สำเร็จ — ลองดำเนินการต่อ")
-        else:
+        if popup_closed:
             log.info("  ✓ ปิด popup สำเร็จ")
+            # รอให้ popup หายจริง ๆ
+            await page.wait_for_timeout(1500)
+        else:
+            log.warning("  ⚠️  ไม่พบ popup หรือปิดไม่สำเร็จ — ลองดำเนินการต่อ")
 
         # Debug: Screenshot หลังปิด popup
         try:
@@ -728,31 +722,120 @@ async def select_promptpay(page: Page) -> bool:
         # ======== เลือก PromptPay ก่อน (ที่หน้า cart) ========
         log.info("กำลังหา PromptPay option ที่หน้า cart...")
 
+        # Scroll ลงมาที่ส่วน Payment ก่อน
+        try:
+            payment_section = page.locator("text=Payment").first
+            if await payment_section.is_visible(timeout=2000):
+                await payment_section.scroll_into_view_if_needed()
+                await page.wait_for_timeout(800)
+                log.info("Scroll ลงมาที่ส่วน Payment แล้ว")
+        except:
+            pass
+
+        # Debug: Screenshot ก่อนเลือก PromptPay
+        try:
+            await page.screenshot(path="debug_before_promptpay.png")
+            log.info("บันทึก screenshot ก่อนเลือก PromptPay")
+        except:
+            pass
+
+        # ลองหา PromptPay ด้วย text ก่อน
         promptpay_selectors = [
-            "[data-testid='payment-option-0']",
-            "button:has-text('PromptPay')",
+            # ลอง 1: หา text "PromptPay" แล้วหา radio ที่ใกล้ที่สุด
+            "text=PromptPay",
+            # ลอง 2: หา div/label ที่มี "PromptPay"
+            "label:has-text('PromptPay')",
             "div:has-text('PromptPay')",
+            # ลอง 3: data-testid
+            "[data-testid='payment-option-0']",
             "[data-testid*='promptpay']",
-            "[data-testid*='qr']",
-            "[class*='payment']:has-text('PromptPay')",
         ]
 
         selected = False
         for selector in promptpay_selectors:
             try:
-                card = page.locator(selector).first
-                if await card.is_visible(timeout=2000):
+                element = page.locator(selector).first
+                if await element.is_visible(timeout=2000):
                     log.info(f"พบ PromptPay ด้วย selector: {selector}")
-                    await card.click(timeout=3000, force=True)
-                    log.info("✓ เลือก PromptPay เรียบร้อย")
+
+                    # Scroll ให้อยู่ตรงกลาง
+                    await element.scroll_into_view_if_needed()
                     await page.wait_for_timeout(500)
-                    selected = True
-                    break
-            except:
+
+                    # ลองหา radio button ที่อยู่ใกล้ element นี้
+                    try:
+                        # ถ้า element นี้เป็น label หรือ div ให้หา input radio ภายใน
+                        radio = element.locator("input[type='radio']").first
+                        if await radio.count() > 0:
+                            log.info("  พบ radio button ภายใน — คลิกที่ radio")
+                            await radio.click(timeout=3000, force=True)
+                        else:
+                            # ถ้าไม่มี radio ภายใน ลองหาข้างนอก (sibling)
+                            parent = element.locator("xpath=..")
+                            radio = parent.locator("input[type='radio']").first
+                            if await radio.count() > 0:
+                                log.info("  พบ radio button ข้างนอก — คลิกที่ radio")
+                                await radio.click(timeout=3000, force=True)
+                            else:
+                                # ถ้าไม่เจอ radio เลย คลิกที่ element
+                                log.info("  ไม่เจอ radio button — คลิกที่ element")
+                                await element.click(timeout=3000, force=True)
+                    except:
+                        # ถ้า error ให้คลิกที่ element
+                        log.info("  คลิกที่ element")
+                        await element.click(timeout=3000, force=True)
+
+                    await page.wait_for_timeout(1000)
+
+                    # ตรวจสอบว่าถูกเลือกจริง ๆ โดยดูจาก:
+                    # 1. element มีกรอบสีเขียว (border-color หรือ class)
+                    # 2. หรือมี aria-checked="true" / data-selected="true"
+                    # 3. หรือมี input[type='radio']:checked
+
+                    is_selected = False
+
+                    # ลอง 1: เช็ค radio input
+                    try:
+                        checked_radio = page.locator("input[type='radio']:checked").first
+                        if await checked_radio.count() > 0:
+                            log.info("✓ เลือก PromptPay เรียบร้อย (พบ radio checked)")
+                            is_selected = True
+                    except:
+                        pass
+
+                    # ลอง 2: เช็ค element ที่คลิกมีกรอบสีเขียวหรือ selected class
+                    if not is_selected:
+                        try:
+                            # ดูว่า element มี border-color เป็นสีเขียวหรือไม่
+                            border_color = await element.evaluate("el => getComputedStyle(el).borderColor")
+                            if "0, 255" in border_color or "0, 178" in border_color or "34, 197" in border_color:
+                                log.info("✓ เลือก PromptPay เรียบร้อย (พบกรอบสีเขียว)")
+                                is_selected = True
+                        except:
+                            pass
+
+                    # ลอง 3: เช็ค aria-checked หรือ data-selected
+                    if not is_selected:
+                        try:
+                            aria_checked = await element.get_attribute("aria-checked")
+                            data_selected = await element.get_attribute("data-selected")
+                            if aria_checked == "true" or data_selected == "true":
+                                log.info("✓ เลือก PromptPay เรียบร้อย (พบ aria-checked/data-selected)")
+                                is_selected = True
+                        except:
+                            pass
+
+                    if is_selected:
+                        selected = True
+                        break
+                    else:
+                        log.warning(f"  ⚠️  คลิกแล้วแต่ยังไม่แน่ใจว่าถูกเลือก — ลอง selector ถัดไป")
+            except Exception as e:
+                log.warning(f"  ลอง selector {selector} ล้มเหลว: {e}")
                 continue
 
         if not selected:
-            log.warning("⚠️  ไม่พบ PromptPay option ที่หน้า cart")
+            log.warning("⚠️  ไม่พบ PromptPay option ที่หน้า cart หรือคลิกไม่สำเร็จ")
 
         # Debug: Screenshot หลังเลือก PromptPay
         try:
