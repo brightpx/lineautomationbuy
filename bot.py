@@ -88,56 +88,92 @@ async def check_size_in_stock(page: Page, sizes: list[str]) -> tuple[bool, str]:
     try:
         # เปิด modal โดยใช้ force=True เพื่อบังคับคลิกแม้มี overlay
         buy_btn = page.get_by_role("button", name="Buy Now", exact=True)
-        await buy_btn.last.click(timeout=2_500, force=True)
+        await buy_btn.last.click(timeout=1_500, force=True)
 
-        # รอ modal ปรากฏและโหลดเสร็จ
+        # รอ modal ปรากฏและโหลดเสร็จ — ลด timeout จาก 2000 → 1000
         try:
-            await page.wait_for_selector("button[role='button']:has-text('y'), button[role='button']:has-text('m')", timeout=3_000)
-            log.info("Modal โหลดเสร็จ")
+            await page.wait_for_selector("button[role='button']:has-text('y'), button[role='button']:has-text('m')", timeout=1_000)
         except:
-            log.warning("Modal อาจยังโหลดไม่เสร็จ — ลองต่อ")
+            pass
 
-        await page.wait_for_timeout(500)
+        # ลด wait จาก 200ms → 50ms
+        await page.wait_for_timeout(50)
 
         # เช็คไซส์ตามลำดับ priority
         for size in sizes:
-            # หาปุ่มที่มีข้อความตรงกับไซส์ exact (ไม่รวมปุ่มที่มีหลายไซส์)
-            matching_buttons = page.locator(f"button:has-text('{size}')").filter(has_text=f"{size}")
-            count = await matching_buttons.count()
+            # ลองหลาย selector
+            # Playwright ใช้ :text("...") สำหรับ exact match
+            selectors = [
+                f'button:text("{size}")',           # button exact text
+                f'[role="button"]:text("{size}")',  # role=button exact text
+                f'div:text("{size}")',              # div exact text
+                f"button:has-text('{size}')",       # button contains (fallback)
+            ]
 
-            # ถ้าไม่เจอเลย รอเพิ่ม
+            matching_buttons = None
+            count = 0
+
+            for selector in selectors:
+                try:
+                    matching_buttons = page.locator(selector)
+                    count = await matching_buttons.count()
+                    if count > 0:
+                        log.info(f"  พบปุ่ม '{size}' ด้วย selector: {selector} ({count} ปุ่ม)")
+                        break
+                except Exception as e:
+                    log.warning(f"  Selector '{selector}' ล้มเหลว: {e}")
+                    continue
+
+            # ถ้าไม่เจอเลย รอเพิ่ม — ลดจาก 300ms → 100ms
             if count == 0:
-                await page.wait_for_timeout(800)
-                count = await matching_buttons.count()
+                await page.wait_for_timeout(100)
+                for selector in selectors:
+                    try:
+                        matching_buttons = page.locator(selector)
+                        count = await matching_buttons.count()
+                        if count > 0:
+                            log.info(f"  หลังรอ: พบปุ่ม '{size}' ด้วย selector: {selector} ({count} ปุ่ม)")
+                            break
+                    except:
+                        continue
+
+            if count == 0:
+                continue
 
             for i in range(count):
                 btn = matching_buttons.nth(i)
-                btn_text = await btn.text_content()
-                btn_text_clean = btn_text.strip()
 
-                # ต้องเป็นไซส์เดียว ไม่ใช่รายการหลายไซส์ (เช่น "12m, 2y, 3y...")
-                # และไม่มี "Buy Now", "Add to cart", "Chat"
-                if (',' in btn_text_clean or
-                    'Buy Now' in btn_text_clean or
-                    'Add to cart' in btn_text_clean or
-                    'Chat' in btn_text_clean or
-                    len(btn_text_clean) > 10):  # ไซส์ปกติไม่เกิน 10 ตัวอักษร
+                try:
+                    btn_text = await btn.text_content()
+                    btn_text_clean = btn_text.strip() if btn_text else ""
+                except:
                     continue
 
-                is_disabled = await btn.is_disabled()
+                # ตรวจสอบว่าเป็นไซส์เดียว
+                if btn_text_clean.lower() != size.lower():
+                    log.info(f"    ข้าม: '{btn_text_clean}' (ไม่ตรงกับ '{size}')")
+                    continue
 
-                # เลือกปุ่มที่ไม่ disabled และเป็นไซส์เดียว
-                if not is_disabled and btn_text_clean.lower() == size.lower():
+                try:
+                    is_disabled = await btn.is_disabled()
+                    is_visible = await btn.is_visible()
+                except:
+                    continue
+
+                log.info(f"    ปุ่ม {i}: '{btn_text_clean}' (disabled={is_disabled}, visible={is_visible})")
+
+                # เลือกปุ่มที่ไม่ disabled และ visible
+                if not is_disabled and is_visible:
                     await btn.click(force=True)
                     log.info(f"✓ เลือกไซส์: {size} (text='{btn_text_clean}')")
                     await page.keyboard.press("Escape")
-                    await page.wait_for_timeout(150)
+                    await page.wait_for_timeout(50)
                     return True, size
 
         # ปิด modal
         log.warning(f"ไม่พบไซส์ {sizes} ที่ใช้งานได้")
         await page.keyboard.press("Escape")
-        await page.wait_for_timeout(150)
+        await page.wait_for_timeout(50)
         return False, ""
 
     except Exception as e:
@@ -178,69 +214,246 @@ async def proceed_to_checkout(page: Page, sizes: list[str]) -> tuple[bool, str]:
       - (False, "error") = error อื่น ๆ
     """
     try:
-        # Step 1 — กด Buy Now เพื่อเปิด modal (ปุ่มเดียวก่อน modal = .last)
-        # ใช้ force=True เพื่อบังคับคลิกแม้มี overlay blocking
-        buy_btn = page.get_by_role("button", name="Buy Now", exact=True)
-        await buy_btn.last.click(timeout=5_000, force=True)
-        log.info("กด Buy Now (เปิด modal)...")
+        # Step 0 — ตรวจสอบว่าอยู่หน้า product
+        current_url = page.url
+        log.info(f"URL ก่อนกด Buy Now: {current_url}")
 
-        # Step 2 — รอ modal ปรากฏและโหลดเสร็จ
-        # รอให้ modal แสดง (รอ element ที่บ่งบอกว่า modal เปิดแล้ว)
+        if "/product/" not in current_url:
+            log.error(f"ไม่อยู่หน้า product! URL: {current_url}")
+            return False, "error"
+
+        # Step 1 — กด Buy Now เพื่อเปิด modal
+        buy_btn = page.get_by_role("button", name="Buy Now", exact=True)
+        btn_count = await buy_btn.count()
+        log.info(f"พบปุ่ม Buy Now: {btn_count} ปุ่ม")
+
+        if btn_count == 0:
+            log.error("ไม่เจอปุ่ม Buy Now!")
+            return False, "error"
+
+        # Debug: ตรวจสอบแต่ละปุ่ม
+        for i in range(btn_count):
+            btn = buy_btn.nth(i)
+            is_visible = await btn.is_visible()
+            is_disabled = await btn.is_disabled()
+            log.info(f"  ปุ่ม Buy Now {i}: visible={is_visible}, disabled={is_disabled}")
+
+        # คลิกปุ่มสุดท้าย (ปุ่มหลัก ไม่ใช่ปุ่มใน modal) ด้วย force=True
         try:
-            # รอให้มีปุ่มไซส์ปรากฏ (ไม่ใช่แค่ปุ่ม Buy Now)
-            await page.wait_for_selector("button[role='button']:has-text('y'), button[role='button']:has-text('m')", timeout=3_000)
-            log.info("Modal โหลดเสร็จ — พบปุ่มไซส์")
+            await buy_btn.last.click(timeout=5_000, force=True)
+            log.info("✓ กด Buy Now สำเร็จ (เปิด modal)...")
+        except Exception as e:
+            log.error(f"✗ ไม่สามารถกด Buy Now ได้: {e}")
+            await page.screenshot(path="debug_click_failed.png")
+            return False, "error"
+
+        # Step 2 — รอให้ปุ่มไซส์ปรากฏ (แสดงว่า modal เปิดแล้ว)
+        try:
+            await page.wait_for_selector(
+                "button:has-text('y'), button:has-text('m'), [class*='size'] button, [class*='Size'] button",
+                timeout=1_500,
+                state="visible"
+            )
+            log.info("✓ Modal เปิดแล้ว — พบปุ่มไซส์")
         except:
             log.warning("Modal อาจยังโหลดไม่เสร็จ — ลองต่อ")
 
-        await page.wait_for_timeout(500)
+        await page.wait_for_timeout(200)
+
+        # ปิด popup ที่อาจขวาง modal (LINE POINTS, โปรโมชั่น)
+        log.info("ตรวจสอบ popup ใน modal...")
+        modal_popup_selectors = [
+            "button:has-text('Close')",
+            "button:has-text('ปิด')",
+            "button:has-text('ไม่ใช้')",
+            "button:has-text('ข้าม')",
+            "button:has-text('×')",
+            "[data-testid*='close']",
+            "[aria-label*='close' i]",
+            "[role='dialog'] button:has-text('Close')",
+            "[role='dialog'] button:has-text('ปิด')",
+        ]
+
+        for selector in modal_popup_selectors:
+            try:
+                popup_btn = page.locator(selector).first
+                if await popup_btn.is_visible(timeout=500):
+                    await popup_btn.click(timeout=1500, force=True)
+                    log.info(f"✓ ปิด popup ใน modal ด้วย: {selector}")
+                    await page.wait_for_timeout(300)  # เพิ่ม wait หลังปิด popup
+                    break
+            except:
+                continue
+
+        # รอให้ modal stabilize หลังปิด popup
+        await page.wait_for_timeout(200)
+
+        # ตรวจสอบ URL หลังกด Buy Now
+        current_url = page.url
+        log.info(f"URL หลังกด Buy Now: {current_url}")
+
+        # ถ้าไปหน้า checkout/cart แล้ว = ระบบเพิ่มสินค้าเข้าตะกร้าอัตโนมัติ (สำเร็จ)
+        if "/checkout/cart" in current_url:
+            log.info("✓ ระบบเพิ่มสินค้าเข้าตะกร้าอัตโนมัติแล้ว — ข้ามขั้นตอนเลือกไซส์")
+
+            # ปิด popup ที่หน้า cart ทันที (LINE POINTS, โปรโมชั่น)
+            log.info("ปิด popup ที่หน้า cart...")
+            try:
+                await page.keyboard.press("Escape")
+                await page.wait_for_timeout(300)
+                log.info("✓ กด Escape")
+            except:
+                pass
+
+            # ลองหาปุ่มปิด popup
+            close_selectors = [
+                "button:has-text('Close')",
+                "button:has-text('ปิด')",
+                "button:has-text('×')",
+                "button:has-text('X')",
+                "button:has-text('ไม่ใช้')",
+                "[aria-label*='close' i]",
+                "[data-testid*='close']",
+            ]
+
+            for selector in close_selectors:
+                try:
+                    close_btn = page.locator(selector).first
+                    if await close_btn.is_visible(timeout=500):
+                        await close_btn.click(timeout=1000, force=True)
+                        log.info(f"✓ ปิด popup ด้วย: {selector}")
+                        await page.wait_for_timeout(300)
+                        break
+                except:
+                    continue
+
+            return True, "success"
+
+        # ถ้าออกจากหน้า product ไปที่อื่น (ไม่ใช่ checkout) = error
+        if "/product/" not in current_url:
+            log.error(f"ออกจากหน้า product ไปที่ไม่คาดคิด: {current_url}")
+            await page.screenshot(path="debug_wrong_page.png")
+            return False, "error"
+
+        # Debug: Screenshot modal หลังเปิด
+        try:
+            await page.screenshot(path="debug_modal.png")
+            log.info("Screenshot modal: debug_modal.png")
+        except:
+            pass
 
         # Step 3 — เลือกไซซ์ตามลำดับ priority
         picked = False
         selected_size = ""
 
+        # ลองหาปุ่ม dropdown ที่แสดงรายการไซส์ทั้งหมด (เช่น "12m, 2y, 3y, ...")
+        # ถ้าเจอ = ต้องกดเพื่อเปิด dropdown ก่อน
+        try:
+            dropdown_selectors = [
+                "button:has-text(',')",  # ปุ่มที่มี comma = รายการหลายไซส์
+                "[role='button']:has-text(',')",
+                "div:has-text(',')[role='button']",
+            ]
+            for selector in dropdown_selectors:
+                dropdown = page.locator(selector).first
+                if await dropdown.count() > 0 and await dropdown.is_visible(timeout=500):
+                    dropdown_text = await dropdown.text_content()
+                    log.info(f"พบ dropdown ไซส์: '{dropdown_text.strip()}' — กดเพื่อเปิด")
+                    await dropdown.click(force=True)
+                    await page.wait_for_timeout(500)
+                    break
+        except Exception as e:
+            log.warning(f"ไม่มี dropdown หรือไม่สามารถกดได้: {e}")
+
         for size in sizes:
             log.info(f"กำลังหาไซส์: {size}")
 
-            # หาปุ่มที่มีข้อความตรงกับไซส์
-            matching_buttons = page.locator(f"button:has-text('{size}')").filter(has_text=f"{size}")
-            count = await matching_buttons.count()
-            log.info(f"  พบปุ่มที่มีข้อความ '{size}': {count} ปุ่ม")
+            # ลองหลาย selector เพราะ LINE Shopping อาจใช้ div หรือ button
+            selectors = [
+                f'button:text("{size}")',           # button exact text
+                f'[role="button"]:text("{size}")',  # role=button exact text
+                f'div:text("{size}")',              # div exact text
+                f"button:has-text('{size}')",       # button contains (fallback)
+            ]
 
-            # ถ้าไม่เจอเลย ให้รอเพิ่มอีกนิด (modal อาจยังโหลดไม่เสร็จ)
+            matching_buttons = None
+            count = 0
+
+            for selector in selectors:
+                try:
+                    matching_buttons = page.locator(selector)
+                    count = await matching_buttons.count()
+                    if count > 0:
+                        log.info(f"  พบปุ่ม '{size}' ด้วย selector: {selector} ({count} ปุ่ม)")
+                        break
+                except Exception as e:
+                    log.warning(f"  Selector '{selector}' ล้มเหลว: {e}")
+                    continue
+
+            # ถ้าไม่เจอเลย ให้รอเพิ่มอีกนิด แล้วลองใหม่
             if count == 0:
                 log.info(f"  ไม่เจอปุ่ม '{size}' — รอ modal โหลดเพิ่ม...")
-                await page.wait_for_timeout(800)
-                count = await matching_buttons.count()
-                log.info(f"  หลังรอ: พบปุ่ม '{size}': {count} ปุ่ม")
+                await page.wait_for_timeout(300)
+
+                # ลองอีกครั้งหลังรอ
+                for selector in selectors:
+                    try:
+                        matching_buttons = page.locator(selector)
+                        count = await matching_buttons.count()
+                        if count > 0:
+                            log.info(f"  พบปุ่ม '{size}' หลังรอ: {selector} ({count} ปุ่ม)")
+                            break
+                    except Exception as e:
+                        continue
+
+                for selector in selectors:
+                    try:
+                        matching_buttons = page.locator(selector)
+                        count = await matching_buttons.count()
+                        if count > 0:
+                            log.info(f"  หลังรอ: พบปุ่ม '{size}' ด้วย selector: {selector} ({count} ปุ่ม)")
+                            break
+                    except:
+                        continue
+
+            if count == 0:
+                log.info(f"  ไม่พบปุ่ม '{size}' เลย")
+                continue
 
             for i in range(count):
                 btn = matching_buttons.nth(i)
-                btn_text = await btn.text_content()
-                btn_text_clean = btn_text.strip()
 
-                # กรองปุ่มที่ไม่ใช่ปุ่มเลือกไซส์
-                # - มี comma (เช่น "12m, 2y, 3y...")
-                # - มีคำว่า Buy Now, Add to cart, Chat
-                # - ยาวเกินไป (ไซส์ปกติไม่เกิน 10 ตัวอักษร)
-                if (',' in btn_text_clean or
-                    'Buy Now' in btn_text_clean or
-                    'Add to cart' in btn_text_clean or
-                    'Chat' in btn_text_clean or
-                    len(btn_text_clean) > 10):
-                    log.info(f"    ข้าม: '{btn_text_clean}' (ไม่ใช่ปุ่มเลือกไซส์)")
+                try:
+                    btn_text = await btn.text_content()
+                    btn_text_clean = btn_text.strip() if btn_text else ""
+                except:
+                    btn_text_clean = ""
+
+                # ตรวจสอบว่าเป็นไซส์เดียว (ไม่ใช่รายการหลายไซส์)
+                if btn_text_clean.lower() != size.lower():
+                    log.info(f"    ข้าม: '{btn_text_clean}' (ไม่ตรงกับไซส์ {size})")
                     continue
 
-                is_disabled = await btn.is_disabled()
-                log.info(f"    ปุ่ม {i}: '{btn_text_clean}' (disabled={is_disabled})")
+                try:
+                    is_disabled = await btn.is_disabled()
+                    is_visible = await btn.is_visible()
+                except:
+                    is_disabled = True
+                    is_visible = False
 
-                # เลือกปุ่มที่ไม่ disabled และเป็นไซส์เดียว
-                if not is_disabled and btn_text_clean.lower() == size.lower():
-                    await btn.click(force=True)
-                    selected_size = size
-                    picked = True
-                    log.info(f"✓ เลือกไซส์: {size} (text='{btn_text_clean}')")
-                    break
+                log.info(f"    ปุ่ม {i}: '{btn_text_clean}' (disabled={is_disabled}, visible={is_visible})")
+
+                # เลือกปุ่มที่ไม่ disabled และ visible
+                if not is_disabled and is_visible:
+                    try:
+                        await btn.click(force=True, timeout=2000)
+                        selected_size = size
+                        picked = True
+                        log.info(f"✓ เลือกไซส์: {size} (text='{btn_text_clean}')")
+                        break
+                    except Exception as e:
+                        log.warning(f"    ไม่สามารถกดปุ่ม {i} ได้: {e}")
+                        continue
 
             if picked:
                 break
@@ -251,12 +464,13 @@ async def proceed_to_checkout(page: Page, sizes: list[str]) -> tuple[bool, str]:
             # ปิด modal ก่อนออก
             try:
                 await page.keyboard.press("Escape")
-                await page.wait_for_timeout(300)
+                await page.wait_for_timeout(100)
             except Exception:
                 pass
             return False, "sold_out"
 
-        await page.wait_for_timeout(400)
+        # ลด wait จาก 200ms → 100ms
+        await page.wait_for_timeout(100)
 
         # Step 4 — กด Buy Now ใน modal (ปุ่มแรกใน modal ที่ไม่ disabled)
         # หาปุ่ม Buy Now ทั้งหมด แล้วเลือกปุ่มที่อยู่ใน modal (visible)
@@ -289,12 +503,12 @@ async def proceed_to_checkout(page: Page, sizes: list[str]) -> tuple[bool, str]:
                 if is_visible and not is_disabled:
                     # ลองกดและดูว่า URL เปลี่ยนหรือไม่
                     log.info(f"  พยายามกดปุ่มที่ {i}...")
-                    await btn.click(timeout=3_000, force=True)  # ใช้ force=True
+                    await btn.click(timeout=2_000, force=True)  # ลด timeout จาก 3000 → 2000
                     log.info(f"  ✓ กด Buy Now ปุ่มที่ {i} สำเร็จ")
                     clicked = True
 
-                    # รอให้ URL เริ่มเปลี่ยน (อย่างน้อย 1 วินาที)
-                    await page.wait_for_timeout(1000)
+                    # ลดการรอจาก 500ms → 200ms
+                    await page.wait_for_timeout(200)
                     log.info(f"  URL หลังกด: {page.url}")
                     break
             except Exception as e:
@@ -319,9 +533,9 @@ async def proceed_to_checkout(page: Page, sizes: list[str]) -> tuple[bool, str]:
         # Step 5 — รอออกจากหน้า product
         log.info("รอเปลี่ยนหน้า (ออกจาก /product/)...")
 
-        # รอให้ URL เปลี่ยนจริง ๆ
+        # รอให้ URL เปลี่ยนจริง ๆ — ลดการรอจาก 1000ms → 500ms
         for attempt in range(5):
-            await page.wait_for_timeout(2000)
+            await page.wait_for_timeout(500)
             current_url = page.url
             log.info(f"  ตรวจสอบครั้งที่ {attempt + 1}: {current_url}")
 
@@ -331,8 +545,8 @@ async def proceed_to_checkout(page: Page, sizes: list[str]) -> tuple[bool, str]:
                 # รอให้หน้า checkout โหลดเสร็จ
                 await page.wait_for_load_state("domcontentloaded", timeout=10_000)
 
-                # ตรวจสอบว่ายังอยู่หน้า checkout จริง ๆ (ไม่ถูก redirect กลับ)
-                await page.wait_for_timeout(2000)
+                # ลดการรอจาก 1000ms → 500ms
+                await page.wait_for_timeout(500)
                 final_url = page.url
 
                 if "/product/" in final_url:
@@ -389,40 +603,212 @@ async def select_promptpay(page: Page) -> bool:
     """
     ทำงานบน /checkout/cart (cart review):
       1. ปิด campaign modal
-      2. กด Place Order → ไปหน้า payment selection
-      3. เลือก PromptPay card
-      4. หยุดรอ — ให้ user กด Place Order เอง
+      2. เลือก PromptPay card (ที่หน้า cart)
+      3. กด Place Order
+      4. หยุดรอ — ให้ user ยืนยันการชำระเงิน
     """
     try:
+        log.info("รอหน้า checkout โหลด...")
         await page.wait_for_load_state("domcontentloaded", timeout=10_000)
+        await page.wait_for_timeout(2000)
 
-        # ปิด campaign modal ถ้ามี
-        close_btn = page.locator("[data-testid='campaign-close-button']")
+        log.info("URL ปัจจุบัน: %s", page.url)
+
+        # Debug: Screenshot หน้า checkout ก่อนปิด popup
         try:
-            await close_btn.click(timeout=3_000)
-            log.info("ปิด campaign modal แล้ว")
-            await page.wait_for_timeout(400)
-        except Exception:
+            await page.screenshot(path="debug_checkout.png")
+            log.info("บันทึก screenshot checkout: debug_checkout.png")
+        except:
             pass
 
-        # กด Place Order (cart → payment selection page)
-        await page.get_by_role("button", name="Place Order").click(timeout=8_000)
-        log.info("กด Place Order — รอหน้า payment...")
-        await page.wait_for_load_state("domcontentloaded", timeout=10_000)
-        await page.wait_for_timeout(1_000)
+        # ปิด popup/modal ที่หน้า checkout (LINE POINTS, LINE Pay, โปรโมชั่น)
+        log.info("ตรวจสอบ popup ที่หน้า checkout...")
 
-        # เลือก PromptPay card บนหน้า payment selection
-        promptpay_card = page.locator("[data-testid='payment-option-0']")
-        await promptpay_card.wait_for(state="visible", timeout=8_000)
-        await promptpay_card.click()
-        log.info("เลือก PromptPay เรียบร้อย — รอคุณกด Place Order เพื่อยืนยันการชำระเงิน")
+        # รอให้ popup โหลดเสร็จก่อน (ถ้ามี)
+        await page.wait_for_timeout(1000)
+
+        # ลอง Escape key ก่อน (เร็วที่สุด)
+        for _ in range(3):
+            try:
+                await page.keyboard.press("Escape")
+                await page.wait_for_timeout(400)
+                log.info("✓ กด Escape เพื่อปิด popup")
+            except:
+                pass
+
+        close_selectors = [
+            # ปุ่มปิด LINE POINTS popup โดยเฉพาะ — ลองทุกรูปแบบ
+            "button:has-text('Shop, earn, and use LINE POINTS!')",
+            "button:has-text('LINE POINTS')",
+            "div:has-text('Shop, earn, and use LINE POINTS!')",
+            "[role='button']:has-text('LINE POINTS')",
+            "[role='button']:has-text('Shop')",
+            "button:has-text('Got it')",
+            "button:has-text('รับทราบ')",
+            "button:has-text('เข้าใจแล้ว')",
+            "button:has-text('OK')",
+            "button:has-text('Close')",
+            "button:has-text('ปิด')",
+            "button:has-text('ไม่ใช้')",
+            "button:has-text('ไม่ใช้คะแนน')",
+            "button:has-text('ข้าม')",
+            "button:has-text('Skip')",
+            "button:has-text('×')",
+            "button:has-text('X')",
+            "button:has-text('✕')",
+            "[data-testid='campaign-close-button']",
+            "[data-testid*='close']",
+            "[data-testid*='dismiss']",
+            "[data-testid*='modal-close']",
+            "[data-testid*='popup-close']",
+            "[aria-label*='close' i]",
+            "[aria-label*='Close' i]",
+            "[aria-label*='ปิด' i]",
+            "[aria-label*='dismiss' i]",
+            "button[class*='close' i]",
+            "button[class*='Close' i]",
+            "[class*='modal'] button:has-text('×')",
+            "[class*='Modal'] button:has-text('×')",
+            "[class*='popup'] button:has-text('×')",
+            "[class*='dialog'] button:has-text('×')",
+            "[role='dialog'] button:has-text('Close')",
+            "[role='dialog'] button:has-text('ปิด')",
+            "[role='dialog'] button[aria-label*='close' i]",
+            # ลอง click ที่มุมบนขวาของ modal (ปกติปุ่มปิดอยู่ที่นี่)
+            "[class*='modal'] [class*='header'] button",
+            "[class*='Modal'] [class*='Header'] button",
+            # ลองหา SVG icon ปิด
+            "button:has(svg)",
+            "[role='button']:has(svg)",
+        ]
+
+        popup_closed = False
+        for attempt in range(5):  # เพิ่มจาก 3 → 5 รอบ
+            if popup_closed:
+                break
+
+            log.info(f"  ครั้งที่ {attempt + 1}: ค้นหา popup...")
+            for selector in close_selectors:
+                try:
+                    close_btn = page.locator(selector).first
+                    if await close_btn.is_visible(timeout=1000):  # เพิ่ม timeout จาก 800 → 1000
+                        btn_text = await close_btn.text_content() or ""
+                        await close_btn.click(timeout=2000, force=True)  # เพิ่ม timeout จาก 1500 → 2000
+                        log.info(f"✓ ปิด popup ด้วย selector: {selector} (text='{btn_text.strip()}')")
+                        await page.wait_for_timeout(800)  # เพิ่มจาก 500 → 800
+                        popup_closed = True
+                        break
+                except Exception as e:
+                    continue
+
+            # ถ้ายังไม่ปิด ลอง Escape อีกครั้ง
+            if not popup_closed:
+                try:
+                    await page.keyboard.press("Escape")
+                    await page.wait_for_timeout(400)
+                    log.info("  กด Escape อีกครั้ง")
+                except:
+                    pass
+
+            if not popup_closed and attempt < 4:  # เปลี่ยนจาก < 2 → < 4
+                await page.wait_for_timeout(1000)  # เพิ่มจาก 800 → 1000
+
+        if not popup_closed:
+            log.warning("  ⚠️  ไม่พบ popup หรือปิดไม่สำเร็จ — ลองดำเนินการต่อ")
+        else:
+            log.info("  ✓ ปิด popup สำเร็จ")
+
+        # Debug: Screenshot หลังปิด popup
+        try:
+            await page.screenshot(path="debug_after_close_popup.png")
+            log.info("บันทึก screenshot หลังปิด popup: debug_after_close_popup.png")
+        except:
+            pass
+
+        # ======== เลือก PromptPay ก่อน (ที่หน้า cart) ========
+        log.info("กำลังหา PromptPay option ที่หน้า cart...")
+
+        promptpay_selectors = [
+            "[data-testid='payment-option-0']",
+            "button:has-text('PromptPay')",
+            "div:has-text('PromptPay')",
+            "[data-testid*='promptpay']",
+            "[data-testid*='qr']",
+            "[class*='payment']:has-text('PromptPay')",
+        ]
+
+        selected = False
+        for selector in promptpay_selectors:
+            try:
+                card = page.locator(selector).first
+                if await card.is_visible(timeout=2000):
+                    log.info(f"พบ PromptPay ด้วย selector: {selector}")
+                    await card.click(timeout=3000, force=True)
+                    log.info("✓ เลือก PromptPay เรียบร้อย")
+                    await page.wait_for_timeout(500)
+                    selected = True
+                    break
+            except:
+                continue
+
+        if not selected:
+            log.warning("⚠️  ไม่พบ PromptPay option ที่หน้า cart")
+
+        # Debug: Screenshot หลังเลือก PromptPay
+        try:
+            await page.screenshot(path="debug_after_select_promptpay.png")
+            log.info("บันทึก screenshot หลังเลือก PromptPay")
+        except:
+            pass
+
+        # ======== แล้วค่อยกด Place Order ========
+        log.info("กำลังหาปุ่ม Place Order...")
+
+        place_order_selectors = [
+            'button:has-text("Place Order")',
+            'button:has-text("สั่งซื้อ")',
+            'button:has-text("ดำเนินการต่อ")',
+            'button:has-text("Proceed")',
+            '[role="button"]:has-text("Place Order")',
+            '[role="button"]:has-text("สั่งซื้อ")',
+        ]
+
+        place_order_btn = None
+        for selector in place_order_selectors:
+            try:
+                btn = page.locator(selector).first
+                if await btn.count() > 0 and await btn.is_visible(timeout=1000):
+                    place_order_btn = btn
+                    log.info(f"พบปุ่ม Place Order ด้วย selector: {selector}")
+                    break
+            except:
+                continue
+
+        if not place_order_btn:
+            log.error("✗ ไม่พบปุ่ม Place Order")
+            await page.screenshot(path="debug_no_place_order.png")
+            return False
+
+        log.info("=" * 60)
+        log.info("✓ ถึงหน้า Place Order พร้อม PromptPay แล้ว")
+        log.info("✓ โปรแกรมจะหยุดที่นี่ — กรุณากด Place Order ในหน้าต่างเบราว์เซอร์")
+        log.info("=" * 60)
+
         return True
 
     except PWTimeout as e:
-        log.error("Timeout ตอนเลือก PromptPay: %s", e)
+        log.error("⏱️  Timeout ตอนเลือก PromptPay: %s", e)
+        try:
+            await page.screenshot(path="debug_promptpay_timeout.png")
+        except:
+            pass
         return False
     except Exception as e:
-        log.error("Error ตอนเลือก PromptPay: %s", e)
+        log.error("❌ Error ตอนเลือก PromptPay: %s", e, exc_info=True)
+        try:
+            await page.screenshot(path="debug_promptpay_error.png")
+        except:
+            pass
         return False
 
 
@@ -472,8 +858,14 @@ async def monitor_and_buy(playwright, product_url: str, preferred_sizes: list[st
             if attempt == 1 or "/product/" not in page.url:
                 # ใช้ domcontentloaded แทน networkidle เพื่อความเร็ว
                 await page.goto(product_url, wait_until="domcontentloaded", timeout=10_000)
-                # ลดเวลารอจาก 1.5s → 0.8s
-                await page.wait_for_timeout(800)
+
+                # ครั้งแรก: รอให้หน้าโหลดเสร็จจริง ๆ (2 วินาที)
+                # ครั้งถัดไป: รอสั้น ๆ (500ms)
+                if attempt == 1:
+                    log.info("โหลดหน้าครั้งแรก — รอ 2 วินาทีให้หน้าโหลดเสร็จ...")
+                    await page.wait_for_timeout(2000)
+                else:
+                    await page.wait_for_timeout(500)
 
             available = await is_product_available(page)
 
@@ -501,6 +893,14 @@ async def monitor_and_buy(playwright, product_url: str, preferred_sizes: list[st
             # มีสต็อก — ซื้อเลย!
             log.info("[ครั้งที่ %d] พบสินค้ามีสต็อก (ไซซ์: %s) — เริ่มซื้อ!", attempt, available_size)
 
+            # ปิด modal ที่ค้างอยู่จาก check_size_in_stock() ก่อน
+            try:
+                await page.keyboard.press("Escape")
+                await page.wait_for_timeout(500)
+                log.info("ปิด modal ที่ค้างอยู่")
+            except:
+                pass
+
             # ปิด resource blocking เพื่อให้ checkout ทำงานปกติ
             await page.unroute("**/*")
 
@@ -510,11 +910,18 @@ async def monitor_and_buy(playwright, product_url: str, preferred_sizes: list[st
                 # ปิด modal + กด Place Order + เลือก PromptPay แล้วหยุดรอ
                 paid = await select_promptpay(page)
                 if paid:
-                    log.info("เลือก PromptPay เรียบร้อย — กรุณากด Place Order เพื่อยืนยันคำสั่งซื้อในหน้าต่างเบราว์เซอร์")
+                    log.info("=" * 60)
+                    log.info("✓ ถึงหน้า Place Order พร้อม PromptPay แล้ว")
+                    log.info("✓ โปรแกรมจะหยุดที่นี่ — กรุณากด Place Order ในหน้าต่างเบราว์เซอร์")
+                    log.info("=" * 60)
                 else:
-                    log.warning("มีปัญหาในขั้นตอนชำระเงิน — กรุณาดำเนินการเองในหน้าต่างเบราว์เซอร์")
-                # ตั้ง flag ออกลูป — อยู่นอก try เพื่อป้องกัน exception วนซ้ำ
+                    log.warning("=" * 60)
+                    log.warning("⚠️  มีปัญหาในขั้นตอนชำระเงิน")
+                    log.warning("⚠️  กรุณาดำเนินการเองในหน้าต่างเบราว์เซอร์")
+                    log.warning("=" * 60)
+                # ออกจาก loop ทันที — ไม่วนซ้ำ
                 do_exit = True
+                break  # ออกจาก loop ทันทีโดยไม่รอ asyncio.sleep()
             elif reason == "sold_out":
                 # ไซส์หมด — เปิด blocking กลับมาแล้ววนลูปต่อ
                 await page.route("**/*", block_resources)
@@ -535,6 +942,15 @@ async def monitor_and_buy(playwright, product_url: str, preferred_sizes: list[st
             break
 
         await asyncio.sleep(check_interval)
+
+    # ถ้าออกจาก loop เพราะถึงหน้า checkout แล้ว — รอไม่จำกัดเวลา
+    if do_exit:
+        log.info("เบราว์เซอร์จะเปิดค้างไว้ — กด Ctrl+C เพื่อออกจากโปรแกรม")
+        try:
+            # รอไม่จำกัดเวลา — user จะปิดเองหรือกด Ctrl+C
+            await asyncio.Event().wait()
+        except KeyboardInterrupt:
+            log.info("ออกจากโปรแกรมตามคำสั่ง user")
 
     await browser.close()
 
