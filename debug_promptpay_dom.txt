@@ -1,0 +1,53 @@
+
+================================================================
+[ก่อนคลิก] URL: https://shop.line.me/@thelandofvava/checkout/cart?data=%257B%2522items%2522%253A%255B%257B%2522productId%2522%253A1008229723%252C%2522productVariantId%2522%253A27433014%252C%2522quantity%2522%253A1%257D%255D%257D
+================================================================
+
+--- text node ที่เป็น 'PromptPay' เป๊ะ ๆ (1) ---
+  [0] ancestor chain:
+      +0 <P> testid='payment-option-0-title' role='' aria-checked='' aria-selected='' class='text-xs font-bold mb-2'
+      +1 <DIV> testid='payment-option-0' role='' aria-checked='' aria-selected='' class='cursor-pointer w-200px shrink-0 border border-gray-200 rounded-5px p-3'
+      +2 <DIV> testid='' role='' aria-checked='' aria-selected='' class='overflow-x-scroll no-scrollbar -mx-4 px-4 flex gap-x-2'
+      +3 <DIV> testid='' role='' aria-checked='' aria-selected='' class=''
+      +4 <SECTION> testid='' role='' aria-checked='' aria-selected='' class='select-none px-4 pt-4'
+      +5 <DIV> testid='' role='' aria-checked='' aria-selected='' class=''
+      HTML: <p data-testid="payment-option-0-title" class="text-xs font-bold mb-2">PromptPay</p>
+
+--- input[type=radio] (0) ---
+
+--- [role=radio] / [aria-checked] (0) ---
+
+--- leaf element ที่มีคำว่า payment (3) ---
+  [0] <DIV> testid='' 'Earn LINE POINTS with any payment!'
+  [1] <HEADER> testid='' 'Payment'
+  [2] <SCRIPT> testid='' '[["ShallowReactive",1],{"data":2,"state":83,"once":96,"_errors":97,"se'
+
+--- selector ที่ bot.py ใช้ resolve ไปที่อะไร ---
+  'text=PromptPay': count=1 first=<P> 196x20px textLen=9 visible=True class='text-xs font-bold mb-2'
+  "label:has-text('PromptPay')": count=0  (ไม่เจอ)
+  "div:has-text('PromptPay')": count=7 first=<DIV> 1280x1423px textLen=946 visible=True class=''
+  "[data-testid='payment-option-0']": count=1 first=<DIV> 225x85px textLen=9 visible=True class='cursor-pointer w-200px shrink-0 border border-gray-200 round'
+  "[data-testid*='promptpay']": count=0  (ไม่เจอ)
+
+================================================================
+[หลังคลิก 1 ครั้ง] URL: https://shop.line.me/@thelandofvava/checkout/cart?data=%257B%2522items%2522%253A%255B%257B%2522productId%2522%253A1008229723%252C%2522productVariantId%2522%253A27433014%252C%2522quantity%2522%253A1%257D%255D%257D
+================================================================
+
+--- text node ที่เป็น 'PromptPay' เป๊ะ ๆ (1) ---
+  [0] ancestor chain:
+      +0 <P> testid='payment-option-0-title' role='' aria-checked='' aria-selected='' class='text-xs font-bold mb-2'
+      +1 <DIV> testid='payment-option-0' role='' aria-checked='' aria-selected='' class='cursor-pointer border-primary-green w-200px shrink-0 border border-gray-200 roun'
+      +2 <DIV> testid='' role='' aria-checked='' aria-selected='' class='overflow-x-scroll no-scrollbar -mx-4 px-4 flex gap-x-2'
+      +3 <DIV> testid='' role='' aria-checked='' aria-selected='' class=''
+      +4 <SECTION> testid='' role='' aria-checked='' aria-selected='' class='select-none px-4 pt-4'
+      +5 <DIV> testid='' role='' aria-checked='' aria-selected='' class=''
+      HTML: <p data-testid="payment-option-0-title" class="text-xs font-bold mb-2">PromptPay</p>
+
+--- input[type=radio] (0) ---
+
+--- [role=radio] / [aria-checked] (0) ---
+
+--- leaf element ที่มีคำว่า payment (3) ---
+  [0] <DIV> testid='' 'Earn LINE POINTS with any payment!'
+  [1] <HEADER> testid='' 'Payment'
+  [2] <SCRIPT> testid='' '[["ShallowReactive",1],{"data":2,"state":83,"once":96,"_errors":97,"se'
