@@ -548,58 +548,69 @@ async def select_promptpay(page: Page, debug_screenshots: bool = False) -> bool:
 
         await save_screenshot(page, "debug_before_promptpay.png", debug_screenshots)
 
-        # ลองหา PromptPay ด้วย text ก่อน
-        promptpay_selectors = [
-            "text=PromptPay",
-            "label:has-text('PromptPay')",
-            "div:has-text('PromptPay')",
-            "[data-testid='payment-option-0']",
-            "[data-testid*='promptpay']",
-        ]
-
+        # ====== วิธีที่น่าเชื่อถือที่สุด ======
+        # เริ่มจาก text node "PromptPay" แบบ exact → walk up หา radio ของ option นั้นโดยตรง
+        # หลีกเลี่ยง:
+        #   - data-testid='payment-option-0'  → อาจเป็น LINE Pay (default option แรก)
+        #   - div:has-text('PromptPay')       → จับ wrapper div ทั้งส่วน, radio แรกใน div คือ LINE Pay
         selected = False
-        for selector in promptpay_selectors:
-            try:
-                element = page.locator(selector).first
-                if await element.is_visible(timeout=1500):
-                    log.info(f"พบ PromptPay ด้วย selector: {selector}")
+        try:
+            pp_text = page.get_by_text("PromptPay", exact=True).first
+            if await pp_text.is_visible(timeout=2000):
+                log.info("พบ text 'PromptPay' (exact) — กำลัง walk up หา radio")
+                await pp_text.scroll_into_view_if_needed()
+                await page.wait_for_timeout(300)
 
-                    await element.scroll_into_view_if_needed()
-                    await page.wait_for_timeout(300)
-
-                    # ลองหา radio button
+                # walk up ancestor ทีละชั้น จนพบ radio button ของ option นี้
+                radio_to_click = None
+                for depth in range(1, 7):
+                    xpath = "/".join([".."] * depth)
                     try:
-                        radio = element.locator("input[type='radio']").first
-                        if await radio.count() > 0:
-                            log.info("  พบ radio button ภายใน — คลิกที่ radio")
-                            await radio.click(timeout=2000, force=True)
-                        else:
-                            parent = element.locator("xpath=..")
-                            radio = parent.locator("input[type='radio']").first
-                            if await radio.count() > 0:
-                                log.info("  พบ radio button ข้างนอก — คลิกที่ radio")
-                                await radio.click(timeout=2000, force=True)
-                            else:
-                                log.info("  ไม่เจอ radio button — คลิกที่ element")
-                                await element.click(timeout=2000, force=True)
-                    except:
-                        log.info("  คลิกที่ element")
-                        await element.click(timeout=2000, force=True)
-
-                    await page.wait_for_timeout(500)
-
-                    # ตรวจสอบว่าถูกเลือกจริง ๆ (เช็คแค่ radio checked)
-                    try:
-                        checked_radio = page.locator("input[type='radio']:checked").first
-                        if await checked_radio.count() > 0:
-                            log.info("✓ เลือก PromptPay เรียบร้อย")
-                            selected = True
+                        candidate = pp_text.locator(f"xpath={xpath}//input[@type='radio']").first
+                        if await candidate.count() > 0:
+                            log.info(f"  พบ radio ที่ ancestor depth={depth}")
+                            radio_to_click = candidate
                             break
                     except:
                         pass
+
+                if radio_to_click is not None:
+                    await radio_to_click.click(timeout=2000, force=True)
+                    await page.wait_for_timeout(500)
+                    try:
+                        if await radio_to_click.is_checked(timeout=1000):
+                            log.info("✓ เลือก PromptPay เรียบร้อย")
+                            selected = True
+                    except:
+                        pass
+                else:
+                    # fallback: คลิกที่ตัวข้อความโดยตรง (กรณี custom UI ไม่ใช้ radio)
+                    log.info("  ไม่เจอ radio — คลิกที่ text element")
+                    await pp_text.click(timeout=2000, force=True)
+                    await page.wait_for_timeout(500)
+                    selected = True  # ถือว่าคลิกไปแล้ว
+
+        except Exception as e:
+            log.warning(f"get_by_text PromptPay ล้มเหลว: {e}")
+
+        # fallback: ถ้า exact text ไม่เจอ ลอง label selector (ไม่ใช้ div/payment-option-0)
+        if not selected:
+            log.info("ลอง fallback selector: label:has-text('PromptPay')")
+            try:
+                lbl = page.locator("label:has-text('PromptPay')").first
+                if await lbl.is_visible(timeout=1500):
+                    await lbl.scroll_into_view_if_needed()
+                    await page.wait_for_timeout(300)
+                    radio = lbl.locator("input[type='radio']").first
+                    if await radio.count() > 0:
+                        await radio.click(timeout=2000, force=True)
+                    else:
+                        await lbl.click(timeout=2000, force=True)
+                    await page.wait_for_timeout(500)
+                    log.info("คลิก PromptPay label แล้ว (fallback)")
+                    selected = True
             except Exception as e:
-                log.warning(f"  ลอง selector {selector} ล้มเหลว: {e}")
-                continue
+                log.warning(f"  label fallback ล้มเหลว: {e}")
 
         if not selected:
             log.warning("⚠️  ไม่พบ PromptPay option ที่หน้า cart หรือคลิกไม่สำเร็จ")
