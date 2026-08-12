@@ -506,22 +506,16 @@ async def select_promptpay(page: Page, debug_screenshots: bool = False) -> bool:
     try:
         log.info("รอหน้า checkout โหลด...")
         await page.wait_for_load_state("domcontentloaded", timeout=10_000)
-        await page.wait_for_timeout(1000)
+        await page.wait_for_timeout(300)
 
         log.info("URL ปัจจุบัน: %s", page.url)
         await save_screenshot(page, "debug_checkout.png", debug_screenshots)
 
-        # ปิด popup/modal ที่หน้า checkout (ลดจาก 6 รอบ → 3 รอบ)
+        # ปิด popup/modal ที่หน้า checkout — ลองรอบเดียว ถ้าไม่เจอก็ผ่านไปเลย
         log.info("ตรวจสอบ popup ที่หน้า checkout...")
-        await page.wait_for_timeout(800)
-
-        for attempt in range(3):
-            popup_closed = await close_popup(page, "checkout")
-            if popup_closed:
-                await page.wait_for_timeout(500)
-                break
-            if attempt < 2:
-                await page.wait_for_timeout(800)
+        popup_closed = await close_popup(page, "checkout")
+        if popup_closed:
+            await page.wait_for_timeout(300)
 
         await save_screenshot(page, "debug_after_close_popup.png", debug_screenshots)
 
@@ -539,9 +533,9 @@ async def select_promptpay(page: Page, debug_screenshots: bool = False) -> bool:
         # Scroll ลงมาที่ส่วน Payment ก่อน
         try:
             payment_section = page.locator("text=Payment").first
-            if await payment_section.is_visible(timeout=2000):
+            if await payment_section.is_visible(timeout=1000):
                 await payment_section.scroll_into_view_if_needed()
-                await page.wait_for_timeout(500)
+                await page.wait_for_timeout(200)
                 log.info("Scroll ลงมาที่ส่วน Payment แล้ว")
         except:
             pass
