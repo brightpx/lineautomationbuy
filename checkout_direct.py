@@ -713,11 +713,61 @@ async def select_promptpay(page: Page) -> bool:
                     }
                 """)
                 log.info("aria-checked หลัง 2nd click = '%s'", after2)
-                pp_clicked = (after2 == 'true')
+                if after2 == 'true':
+                    pp_clicked = True
+                else:
+                    # ลอง force click ด้วย JS โดยตรง
+                    log.info("ลอง JS force click...")
+                    js_result = await page.evaluate("""
+                        () => {
+                            const walker = document.createTreeWalker(
+                                document.body, NodeFilter.SHOW_TEXT, null);
+                            while (walker.nextNode()) {
+                                if (walker.currentNode.textContent.trim().toLowerCase() !== 'promptpay')
+                                    continue;
+                                let el = walker.currentNode.parentElement;
+                                for (let i = 0; i < 6 && el && el !== document.body; i++) {
+                                    const cls = (el.className || '').toLowerCase();
+                                    if (cls.includes('cursor-pointer')) {
+                                        el.click();
+                                        el.dispatchEvent(new MouseEvent('mousedown', {bubbles: true}));
+                                        el.dispatchEvent(new MouseEvent('mouseup', {bubbles: true}));
+                                        el.dispatchEvent(new MouseEvent('click', {bubbles: true}));
+                                        return {clicked: true, tag: el.tagName, cls: el.className.slice(0,50)};
+                                    }
+                                    el = el.parentElement;
+                                }
+                            }
+                            return {clicked: false};
+                        }
+                    """)
+                    if js_result.get("clicked"):
+                        log.info("  JS click <%s> cls='%s'", js_result.get("tag"), js_result.get("cls"))
+                        await page.wait_for_timeout(800)
+                        after3 = await page.evaluate("""
+                            () => {
+                                const walker = document.createTreeWalker(
+                                    document.body, NodeFilter.SHOW_TEXT, null);
+                                while (walker.nextNode()) {
+                                    if (walker.currentNode.textContent.trim().toLowerCase() !== 'promptpay')
+                                        continue;
+                                    let el = walker.currentNode.parentElement;
+                                    for (let i = 0; i < 8 && el && el !== document.body; i++) {
+                                        const ac = el.getAttribute('aria-checked');
+                                        if (ac !== null) return ac;
+                                        el = el.parentElement;
+                                    }
+                                    return 'not-found';
+                                }
+                                return 'no-text';
+                            }
+                        """)
+                        log.info("aria-checked หลัง JS click = '%s'", after3)
+                        pp_clicked = (after3 == 'true')
         else:
             log.warning("⚠️  ไม่พบ target สำหรับ PromptPay click")
 
-        # กลยุทธ์สำรอง: หา hidden <input type="radio"> ที่อยู่ใกล้ PromptPay แล้ว JS click
+        # กลยุทธ์สำรอง 1: หา hidden <input type="radio"> ที่อยู่ใกล้ PromptPay แล้ว JS click
         if not pp_clicked:
             log.info("ลอง hidden radio input near PromptPay...")
             pp_radio = await page.evaluate("""
@@ -729,13 +779,19 @@ async def select_promptpay(page: Page) -> bool:
                         const label = r.closest('label') || r.parentElement;
                         const txt = label ? label.textContent.toLowerCase() : '';
                         if (txt.includes('promptpay')) {
+                            r.checked = true;
                             r.click();
+                            r.dispatchEvent(new Event('change', {bubbles: true}));
+                            r.dispatchEvent(new Event('input', {bubbles: true}));
                             return { ok: true, method: 'label-text', id: r.id, val: r.value };
                         }
                         // ดู sibling/cousin ที่มี promptpay text
                         const container = r.closest('li') || r.closest('[role="listitem"]') || r.parentElement?.parentElement;
                         if (container && container.textContent.toLowerCase().includes('promptpay')) {
+                            r.checked = true;
                             r.click();
+                            r.dispatchEvent(new Event('change', {bubbles: true}));
+                            r.dispatchEvent(new Event('input', {bubbles: true}));
                             return { ok: true, method: 'container-text', id: r.id, val: r.value };
                         }
                     }
@@ -748,7 +804,13 @@ async def select_promptpay(page: Page) -> bool:
                         let el = walker.currentNode.parentElement;
                         for (let i = 0; i < 6 && el && el !== document.body; i++) {
                             const r = el.querySelector('input[type="radio"]');
-                            if (r) { r.click(); return { ok: true, method: 'sibling-radio', id: r.id }; }
+                            if (r) {
+                                r.checked = true;
+                                r.click();
+                                r.dispatchEvent(new Event('change', {bubbles: true}));
+                                r.dispatchEvent(new Event('input', {bubbles: true}));
+                                return { ok: true, method: 'sibling-radio', id: r.id };
+                            }
                             el = el.parentElement;
                         }
                     }
@@ -786,11 +848,111 @@ async def select_promptpay(page: Page) -> bool:
             else:
                 log.warning("⚠️  ไม่พบ radio input ใกล้ PromptPay")
 
+        # กลยุทธ์สำรอง 2: ใช้ Playwright locator กับ text "PromptPay" แล้วคลิก parent
+        if not pp_clicked:
+            log.info("ลอง Playwright locator text=PromptPay...")
+            try:
+                pp_locator = page.get_by_text("PromptPay", exact=True).first
+                if await pp_locator.count() > 0:
+                    parent = pp_locator.locator("xpath=ancestor::*[contains(@class,'cursor-pointer') or @role='radio' or @role='button'][1]")
+                    if await parent.count() > 0:
+                        await parent.click(force=True)
+                        log.info("  คลิก ancestor with cursor-pointer/radio/button")
+                        await page.wait_for_timeout(800)
+                    else:
+                        # fallback: คลิก parent โดยตรง
+                        await pp_locator.click(force=True)
+                        log.info("  คลิก text node โดยตรง")
+                        await page.wait_for_timeout(800)
+                    
+                    after_loc = await page.evaluate("""
+                        () => {
+                            const walker = document.createTreeWalker(
+                                document.body, NodeFilter.SHOW_TEXT, null);
+                            while (walker.nextNode()) {
+                                if (walker.currentNode.textContent.trim().toLowerCase() !== 'promptpay')
+                                    continue;
+                                let el = walker.currentNode.parentElement;
+                                for (let i = 0; i < 8 && el && el !== document.body; i++) {
+                                    const ac = el.getAttribute('aria-checked');
+                                    if (ac !== null) return ac;
+                                    el = el.parentElement;
+                                }
+                                return 'not-found';
+                            }
+                            return 'no-text';
+                        }
+                    """)
+                    log.info("aria-checked หลัง locator click = '%s'", after_loc)
+                    pp_clicked = (after_loc == 'true')
+            except Exception as e:
+                log.warning("⚠️  Playwright locator ล้มเหลว: %s", e)
+
         await page.wait_for_timeout(300)
 
         # ── Step D: ตรวจผลและหา Place Order button ──
         if not pp_clicked:
-            log.warning("⚠️  เลือก PromptPay ไม่สำเร็จ — ตรวจสอบหน้าจอก่อน Place Order")
+            log.warning("⚠️  เลือก PromptPay ไม่สำเร็จ — ลองกลยุทธ์สุดท้าย: Vue reactive update")
+            # บาง Vue component ต้อง trigger reactive update ด้วย input event
+            pp_final = await page.evaluate("""
+                () => {
+                    const walker = document.createTreeWalker(
+                        document.body, NodeFilter.SHOW_TEXT, null);
+                    while (walker.nextNode()) {
+                        if (walker.currentNode.textContent.trim().toLowerCase() !== 'promptpay')
+                            continue;
+                        let el = walker.currentNode.parentElement;
+                        for (let i = 0; i < 6 && el && el !== document.body; i++) {
+                            const cls = (el.className || '').toLowerCase();
+                            if (cls.includes('cursor-pointer') || cls.includes('select') || cls.includes('option')) {
+                                // Simulate full Vue click chain
+                                el.dispatchEvent(new MouseEvent('mousedown', {bubbles: true, cancelable: true}));
+                                el.dispatchEvent(new MouseEvent('mouseup', {bubbles: true, cancelable: true}));
+                                el.dispatchEvent(new MouseEvent('click', {bubbles: true, cancelable: true}));
+                                el.dispatchEvent(new Event('input', {bubbles: true}));
+                                el.dispatchEvent(new Event('change', {bubbles: true}));
+                                // ลอง set aria-checked โดยตรง
+                                el.setAttribute('aria-checked', 'true');
+                                let parent = el.parentElement;
+                                for (let j = 0; j < 3 && parent; j++) {
+                                    parent.setAttribute('aria-checked', 'true');
+                                    parent = parent.parentElement;
+                                }
+                                return {ok: true, tag: el.tagName, cls: el.className.slice(0,60)};
+                            }
+                            el = el.parentElement;
+                        }
+                    }
+                    return {ok: false};
+                }
+            """)
+            if pp_final and pp_final.get("ok"):
+                log.info("  Vue reactive click <%s> cls='%s'", pp_final.get("tag"), pp_final.get("cls"))
+                await page.wait_for_timeout(1000)
+                after_final = await page.evaluate("""
+                    () => {
+                        const walker = document.createTreeWalker(
+                            document.body, NodeFilter.SHOW_TEXT, null);
+                        while (walker.nextNode()) {
+                            if (walker.currentNode.textContent.trim().toLowerCase() !== 'promptpay')
+                                continue;
+                            let el = walker.currentNode.parentElement;
+                            for (let i = 0; i < 8 && el && el !== document.body; i++) {
+                                const ac = el.getAttribute('aria-checked');
+                                if (ac !== null) return ac;
+                                el = el.parentElement;
+                            }
+                            return 'not-found';
+                        }
+                        return 'no-text';
+                    }
+                """)
+                log.info("aria-checked หลัง Vue reactive = '%s'", after_final)
+                pp_clicked = (after_final == 'true')
+
+        if not pp_clicked:
+            log.warning("⚠️  เลือก PromptPay ไม่สำเร็จหลังจากลองทุกวิธี — อาจต้องเลือกด้วยมือ")
+            log.warning("⚠️  browser จะเปิดค้างไว้ — เลือก PromptPay ด้วยมือแล้วกลับมากด Enter")
         else:
             log.info("✓ PromptPay เลือกแล้ว")
         place_order_btn = page.locator(
