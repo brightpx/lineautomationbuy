@@ -540,14 +540,133 @@ async def select_promptpay(page: Page) -> bool:
         except Exception:
             pass
 
-        # ── Step C: เลือก PromptPay ──
+        # ── Step C: ปิด popup/overlay ก่อน แล้วเลือก PromptPay ──
+        log.info("ปิด popup ก่อนเลือก PromptPay...")
+        # กด Escape + ปิดปุ่มปิดทุกแบบ
+        for _ in range(3):
+            await close_popup(page, "before-promptpay")
+            await page.wait_for_timeout(200)
+
+        # ปิด overlay โดยตรงผ่าน JS (บาง popup ไม่มีปุ่มปิด)
+        dismissed = await page.evaluate("""
+            () => {
+                const dismissed = [];
+                // ซ่อน modal backdrop / overlay
+                document.querySelectorAll(
+                    '[class*="modal"],[class*="overlay"],[class*="backdrop"],[class*="dialog"]'
+                ).forEach(el => {
+                    const s = window.getComputedStyle(el);
+                    if (s.position === 'fixed' || s.position === 'absolute') {
+                        el.style.display = 'none';
+                        dismissed.push(el.className.slice(0,40));
+                    }
+                });
+                // คลิกปุ่ม Got it / T&C / รับทราบ
+                const closeTexts = ['got it','รับทราบ','ตกลง','ok','close','ปิด','ยืนยัน','confirm'];
+                document.querySelectorAll('button,[role="button"]').forEach(btn => {
+                    const t = btn.textContent.trim().toLowerCase();
+                    if (closeTexts.some(c => t === c || t.includes(c))) {
+                        btn.click();
+                        dismissed.push('btn:' + btn.textContent.trim().slice(0,20));
+                    }
+                });
+                return dismissed;
+            }
+        """)
+        if dismissed:
+            log.info("  ปิด popup/overlay: %s", dismissed)
+            await page.wait_for_timeout(400)
+
         log.info("เลือก PromptPay...")
         pp_clicked = False
 
-        # --- helper: ตรวจว่า PromptPay ถูก select อยู่หรือไม่ ---
-        async def _is_pp_selected() -> bool | None:
-            """คืน True=selected, False=deselected, None=ไม่รู้"""
-            return await page.evaluate("""
+        # --- dump payment DOM เพื่อ debug ---
+        pay_dump = await page.evaluate("""
+            () => {
+                const walker = document.createTreeWalker(
+                    document.body, NodeFilter.SHOW_TEXT, null);
+                while (walker.nextNode()) {
+                    if (walker.currentNode.textContent.trim().toLowerCase() !== 'promptpay')
+                        continue;
+                    const ancestors = [];
+                    let el = walker.currentNode.parentElement;
+                    for (let i = 0; i < 6 && el && el !== document.body; i++) {
+                        const bb = el.getBoundingClientRect();
+                        ancestors.push({
+                            i, tag: el.tagName, cls: (el.className||'').slice(0,80),
+                            role: el.getAttribute('role')||'',
+                            tabindex: el.getAttribute('tabindex'),
+                            cursor: window.getComputedStyle(el).cursor,
+                            ariaChecked: el.getAttribute('aria-checked')||'',
+                            w: Math.round(bb.width), h: Math.round(bb.height),
+                            cx: Math.round(bb.left + bb.width/2),
+                            cy: Math.round(bb.top + bb.height/2),
+                        });
+                        el = el.parentElement;
+                    }
+                    return ancestors;
+                }
+                return null;
+            }
+        """)
+        if pay_dump:
+            for row in pay_dump:
+                log.info("  PP ancestor[%d] <%s> cls='%s' role='%s' tabindex=%s cursor=%s aria-checked='%s' size=%dx%d center=(%d,%d)",
+                         row["i"], row["tag"], row["cls"], row["role"],
+                         row["tabindex"], row["cursor"], row["ariaChecked"],
+                         row["w"], row["h"], row["cx"], row["cy"])
+        else:
+            log.warning("  ⚠️  ไม่พบ PromptPay text node ใน DOM dump")
+
+        # กลยุทธ์หลัก: หา element ที่มี aria-checked='false' ใกล้ PromptPay ที่สุด
+        # แล้วคลิกด้วย mouse.click() ที่ center coordinates
+        pp_target = await page.evaluate("""
+            () => {
+                const vw = window.innerWidth;
+                const walker = document.createTreeWalker(
+                    document.body, NodeFilter.SHOW_TEXT, null);
+                while (walker.nextNode()) {
+                    if (walker.currentNode.textContent.trim().toLowerCase() !== 'promptpay')
+                        continue;
+                    let el = walker.currentNode.parentElement;
+                    for (let i = 0; i < 8 && el && el !== document.body; i++) {
+                        const bb = el.getBoundingClientRect();
+                        if (bb.width > vw * 0.9 || bb.width === 0) { el = el.parentElement; continue; }
+                        const ownCls = (el.className || '').toLowerCase();
+                        const isCard = ownCls.includes('cursor-pointer') && bb.height > 30;
+                        if (isCard) {
+                            return { cx: bb.left + bb.width/2, cy: bb.top + bb.height/2,
+                                     tag: el.tagName, cls: el.className.slice(0,80),
+                                     w: bb.width, h: bb.height, method: 'cursor-pointer-class' };
+                        }
+                        el = el.parentElement;
+                    }
+                    el = walker.currentNode.parentElement?.parentElement;
+                    if (el) {
+                        const bb = el.getBoundingClientRect();
+                        if (bb.width > 0 && bb.width < vw * 0.9 && bb.height > 30)
+                            return { cx: bb.left + bb.width/2, cy: bb.top + bb.height/2,
+                                     tag: el.tagName, cls: el.className.slice(0,80),
+                                     w: bb.width, h: bb.height, method: 'parent2-fallback' };
+                    }
+                }
+                return null;
+            }
+        """)
+
+        if pp_target:
+            log.info("คลิก PromptPay <%s> method=%s size=%dx%d at (%d,%d)",
+                     pp_target["tag"], pp_target["method"],
+                     pp_target["w"], pp_target["h"],
+                     pp_target["cx"], pp_target["cy"])
+            # ใช้ mouse.click() กับ coordinates จริงแทน element.click()
+            await page.mouse.move(pp_target["cx"], pp_target["cy"])
+            await page.wait_for_timeout(100)
+            await page.mouse.click(pp_target["cx"], pp_target["cy"])
+            await page.wait_for_timeout(800)
+
+            # ตรวจ aria-checked หลัง click
+            after_state = await page.evaluate("""
                 () => {
                     const walker = document.createTreeWalker(
                         document.body, NodeFilter.SHOW_TEXT, null);
@@ -555,123 +674,125 @@ async def select_promptpay(page: Page) -> bool:
                         if (walker.currentNode.textContent.trim().toLowerCase() !== 'promptpay')
                             continue;
                         let el = walker.currentNode.parentElement;
-                        for (let i = 0; i < 10 && el && el !== document.body; i++) {
-                            const cls = (el.className || '').toLowerCase();
-                            const aria = el.getAttribute('aria-checked') || el.getAttribute('aria-selected') || '';
-                            const dataSel = el.getAttribute('data-selected') || el.getAttribute('data-active') || '';
-                            if (aria === 'true' || dataSel === 'true' || dataSel === '1' ||
-                                cls.includes('selected') || cls.includes('--active') ||
-                                cls.includes('is-active') || cls.includes('is-selected') ||
-                                cls.includes('checked') || cls.includes('active')) {
-                                return true;
-                            }
+                        for (let i = 0; i < 8 && el && el !== document.body; i++) {
+                            const ac = el.getAttribute('aria-checked');
+                            if (ac !== null) return ac;
                             el = el.parentElement;
                         }
-                        return false;
+                        return 'not-found';
                     }
-                    return null;
+                    return 'no-text';
                 }
             """)
+            log.info("aria-checked หลัง click = '%s'", after_state)
 
-        # กลยุทธ์ 1: Playwright native click (simulate real mouse events) ระดับต่างๆ
-        # เริ่มจาก grandparent 2-3 ชั้น ซึ่งมักเป็น payment-option card
-        native_selectors = [
-            'li:has-text("PromptPay")',
-            '[role="listitem"]:has-text("PromptPay")',
-            '[role="option"]:has-text("PromptPay")',
-            '[role="button"]:has-text("PromptPay")',
-            '[role="radio"]:has-text("PromptPay")',
-            'label:has-text("PromptPay")',
-        ]
-        for sel in native_selectors:
-            try:
-                loc = page.locator(sel).first
-                if await loc.count() == 0 or not await loc.is_visible(timeout=300):
-                    continue
-                await loc.click(timeout=2000, force=True)
-                await page.wait_for_timeout(500)
-                state = await _is_pp_selected()
-                if state is True or state is None:
-                    log.info("✓ PromptPay selected (%s)", sel)
-                    pp_clicked = True
-                    break
-                log.debug("  %s → clicked แต่ยัง deselected", sel)
-            except Exception:
-                continue
-
-        # กลยุทธ์ 2: เดิน ancestor ด้วย XPath (level 1-4 จาก text node)
-        if not pp_clicked:
-            pp_text = page.get_by_text("PromptPay", exact=True).first
-            if await pp_text.count() > 0:
-                for level, xpath in enumerate(
-                    ["xpath=..", "xpath=../..", "xpath=../../..", "xpath=../../../.."], 1
-                ):
-                    try:
-                        target = pp_text.locator(xpath)
-                        if await target.count() == 0 or not await target.is_visible(timeout=200):
-                            continue
-                        await target.click(timeout=2000, force=True)
-                        await page.wait_for_timeout(500)
-                        state = await _is_pp_selected()
-                        if state is True or state is None:
-                            log.info("✓ PromptPay selected (ancestor level %d)", level)
-                            pp_clicked = True
-                            break
-                        log.debug("  ancestor level %d → deselected ลองถัดไป", level)
-                    except Exception:
-                        continue
-
-        # กลยุทธ์ 3: JS inject + dispatchEvent ครบชุด (Vue ต้องการ mousedown/up ด้วย)
-        if not pp_clicked:
-            log.info("ลอง JS dispatchEvent สำหรับ PromptPay...")
-            pp3 = await page.evaluate("""
-                () => {
-                    function fireClick(el) {
-                        ['mouseover','mousedown','mouseup','click'].forEach(type => {
-                            el.dispatchEvent(new MouseEvent(type, {bubbles: true, cancelable: true}));
-                        });
-                        el.dispatchEvent(new Event('change', {bubbles: true}));
-                        el.dispatchEvent(new Event('input', {bubbles: true}));
+            if after_state == 'true':
+                log.info("✓ PromptPay selected (aria-checked=true)")
+                pp_clicked = True
+            elif after_state in ('false', 'not-found', 'no-text'):
+                log.warning("⚠️  ยัง aria-checked='%s' — ลอง double-click...", after_state)
+                # double-click อาจช่วยถ้า Vue toggle ต้องการ 2 events
+                await page.mouse.click(pp_target["cx"], pp_target["cy"])
+                await page.wait_for_timeout(600)
+                after2 = await page.evaluate("""
+                    () => {
+                        const walker = document.createTreeWalker(
+                            document.body, NodeFilter.SHOW_TEXT, null);
+                        while (walker.nextNode()) {
+                            if (walker.currentNode.textContent.trim().toLowerCase() !== 'promptpay')
+                                continue;
+                            let el = walker.currentNode.parentElement;
+                            for (let i = 0; i < 8 && el && el !== document.body; i++) {
+                                const ac = el.getAttribute('aria-checked');
+                                if (ac !== null) return ac;
+                                el = el.parentElement;
+                            }
+                            return 'not-found';
+                        }
+                        return 'no-text';
                     }
+                """)
+                log.info("aria-checked หลัง 2nd click = '%s'", after2)
+                pp_clicked = (after2 == 'true')
+        else:
+            log.warning("⚠️  ไม่พบ target สำหรับ PromptPay click")
+
+        # กลยุทธ์สำรอง: หา hidden <input type="radio"> ที่อยู่ใกล้ PromptPay แล้ว JS click
+        if not pp_clicked:
+            log.info("ลอง hidden radio input near PromptPay...")
+            pp_radio = await page.evaluate("""
+                () => {
+                    // หา input[type=radio] ทุกอัน แล้วหาอันที่ใกล้ PromptPay text ที่สุด
+                    const radios = [...document.querySelectorAll('input[type="radio"]')];
+                    let best = null, bestDist = Infinity;
+                    for (const r of radios) {
+                        const label = r.closest('label') || r.parentElement;
+                        const txt = label ? label.textContent.toLowerCase() : '';
+                        if (txt.includes('promptpay')) {
+                            r.click();
+                            return { ok: true, method: 'label-text', id: r.id, val: r.value };
+                        }
+                        // ดู sibling/cousin ที่มี promptpay text
+                        const container = r.closest('li') || r.closest('[role="listitem"]') || r.parentElement?.parentElement;
+                        if (container && container.textContent.toLowerCase().includes('promptpay')) {
+                            r.click();
+                            return { ok: true, method: 'container-text', id: r.id, val: r.value };
+                        }
+                    }
+                    // fallback: หา element ที่มี promptpay แล้วหา radio ภายใน
                     const walker = document.createTreeWalker(
                         document.body, NodeFilter.SHOW_TEXT, null);
                     while (walker.nextNode()) {
-                        const txt = walker.currentNode.textContent.trim();
-                        if (txt.toLowerCase() !== 'promptpay') continue;
+                        if (walker.currentNode.textContent.trim().toLowerCase() !== 'promptpay')
+                            continue;
                         let el = walker.currentNode.parentElement;
-                        for (let i = 0; i < 6; i++) {
-                            if (!el || el === document.body) break;
-                            const s = window.getComputedStyle(el);
-                            const clickable = el.onclick
-                                || el.getAttribute('role') === 'button'
-                                || el.getAttribute('tabindex') != null
-                                || s.cursor === 'pointer';
-                            if (clickable) {
-                                fireClick(el);
-                                return { ok: true, tag: el.tagName, cls: el.className?.slice(0,60) };
-                            }
+                        for (let i = 0; i < 6 && el && el !== document.body; i++) {
+                            const r = el.querySelector('input[type="radio"]');
+                            if (r) { r.click(); return { ok: true, method: 'sibling-radio', id: r.id }; }
                             el = el.parentElement;
                         }
-                        // fallback: grandparent 3
-                        let fb = walker.currentNode.parentElement;
-                        for (let j = 0; j < 3 && fb?.parentElement; j++) fb = fb.parentElement;
-                        if (fb) { fireClick(fb); return { ok: true, tag: fb.tagName, fallback: true }; }
                     }
                     return { ok: false };
                 }
             """)
-            if pp3 and pp3.get("ok"):
-                await page.wait_for_timeout(600)
-                log.info("✓ JS dispatchEvent PromptPay: <%s class='%s'>%s",
-                         pp3.get("tag", "?"), pp3.get("cls", ""),
-                         " (fallback)" if pp3.get("fallback") else "")
-                pp_clicked = True
+            if pp_radio and pp_radio.get("ok"):
+                await page.wait_for_timeout(800)
+                # ตรวจ aria-checked หลัง radio click
+                after_radio = await page.evaluate("""
+                    () => {
+                        const walker = document.createTreeWalker(
+                            document.body, NodeFilter.SHOW_TEXT, null);
+                        while (walker.nextNode()) {
+                            if (walker.currentNode.textContent.trim().toLowerCase() !== 'promptpay')
+                                continue;
+                            let el = walker.currentNode.parentElement;
+                            for (let i = 0; i < 8 && el && el !== document.body; i++) {
+                                const ac = el.getAttribute('aria-checked');
+                                if (ac !== null) return ac;
+                                el = el.parentElement;
+                            }
+                            return 'no-aria';
+                        }
+                        return 'no-text';
+                    }
+                """)
+                log.info("radio click method=%s → aria-checked='%s'",
+                         pp_radio.get("method"), after_radio)
+                if after_radio == 'true':
+                    log.info("✓ PromptPay selected via hidden radio")
+                    pp_clicked = True
+                else:
+                    log.warning("⚠️  radio click แล้วแต่ aria-checked='%s'", after_radio)
             else:
-                log.warning("⚠️  ไม่พบ PromptPay text node ในหน้าเลย — ดำเนินการต่อ")
+                log.warning("⚠️  ไม่พบ radio input ใกล้ PromptPay")
 
         await page.wait_for_timeout(300)
 
-        # ── Step D: หา Place Order button ──
+        # ── Step D: ตรวจผลและหา Place Order button ──
+        if not pp_clicked:
+            log.warning("⚠️  เลือก PromptPay ไม่สำเร็จ — ตรวจสอบหน้าจอก่อน Place Order")
+        else:
+            log.info("✓ PromptPay เลือกแล้ว")
         place_order_btn = page.locator(
             'button:has-text("Place Order"), button:has-text("สั่งซื้อ"), '
             '[role="button"]:has-text("Place Order"), [role="button"]:has-text("สั่งซื้อ")'
@@ -687,7 +808,7 @@ async def select_promptpay(page: Page) -> bool:
         except Exception:
             pass
 
-        log.info("✓ PromptPay เลือกแล้ว — พร้อม Place Order")
+        log.info("พร้อม Place Order (pp_clicked=%s)", pp_clicked)
         return True
 
     except PWTimeout as e:
