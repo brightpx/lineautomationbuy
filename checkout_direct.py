@@ -12,6 +12,7 @@ import asyncio
 import json
 import logging
 import re
+import sys
 import time
 import urllib.parse
 from datetime import datetime, time as dt_time
@@ -20,6 +21,10 @@ from typing import Any, Callable, Optional
 
 import httpx
 from playwright.async_api import async_playwright, Page, Response, TimeoutError as PWTimeout, Browser, BrowserContext
+
+# Windows keyboard detection
+if sys.platform == 'win32':
+    import msvcrt
 
 # ==================== LOGGING ====================
 logging.basicConfig(
@@ -804,14 +809,14 @@ async def fetch_shop_products(shop_url: str, session_file: str) -> list[dict]:
         page = await context.new_page()
         
         try:
-            # Navigate and wait for network idle
-            await page.goto(shop_url, wait_until="networkidle", timeout=30000)
+            # Navigate and wait for DOM ready (faster than networkidle)
+            await page.goto(shop_url, wait_until="domcontentloaded", timeout=10000)
             
-            # Wait for product cards to appear (or timeout after 5 seconds)
+            # Wait for product cards to appear (or timeout after 3 seconds)
             try:
-                await page.wait_for_selector('a[href*="/product/"]', timeout=5000)
+                await page.wait_for_selector('a[href*="/product/"]', timeout=3000)
             except Exception:
-                log.debug("ไม่พบ product links ภายใน 5 วินาที")
+                log.debug("ไม่พบ product links ภายใน 3 วินาที")
             
             # Extract products from DOM
             product_links = await page.query_selector_all('a[href*="/product/"]')
@@ -928,9 +933,11 @@ async def monitor_shop_for_new_products(
     check_interval_ms: int,
     session_file: str,
     product_name_pattern: Optional[str] = None,
+    force_polling: bool = False,
 ) -> dict:
     """
     Monitor ร้านและคืน product ใหม่ที่โผล่ขึ้นมา
+    force_polling: ถ้า True จะข้ามการรอเวลาและเริ่ม polling ทันที
     Returns: {"id": int, "url": str, "name": str}
     """
     log.info("📡 โหลด baseline products...")
@@ -944,20 +951,23 @@ async def monitor_shop_for_new_products(
     else:
         log.warning("⚠️  ไม่พบสินค้าใด (อาจเป็นเพราะร้านยังไม่เปิดขาย)")
 
-    # รอเวลา sale_start_time
-    target_time = parse_sale_time(sale_start_time)
-    now = datetime.now()
-    target_dt = datetime.combine(now.date(), target_time)
+    # รอเวลา sale_start_time (ยกเว้นถ้า force_polling=True)
+    if not force_polling:
+        target_time = parse_sale_time(sale_start_time)
+        now = datetime.now()
+        target_dt = datetime.combine(now.date(), target_time)
 
-    # ถ้าเวลาผ่านไปแล้ว → ใช้วันถัดไป
-    if target_dt < now:
-        from datetime import timedelta
-        target_dt += timedelta(days=1)
+        # ถ้าเวลาผ่านไปแล้ว → ใช้วันถัดไป
+        if target_dt < now:
+            from datetime import timedelta
+            target_dt += timedelta(days=1)
 
-    wait_seconds = (target_dt - datetime.now()).total_seconds()
-    if wait_seconds > 0:
-        log.info("⏰ รอจนถึงเวลาขาย %s (อีก %.1f วินาที)...", sale_start_time, wait_seconds)
-        await asyncio.sleep(wait_seconds)
+        wait_seconds = (target_dt - datetime.now()).total_seconds()
+        if wait_seconds > 0:
+            log.info("⏰ รอจนถึงเวลาขาย %s (อีก %.1f วินาที)...", sale_start_time, wait_seconds)
+            await asyncio.sleep(wait_seconds)
+    else:
+        log.info("⚡ force_polling=True — เริ่ม polling ทันทีโดยไม่รอเวลาขาย")
 
     interval_sec = check_interval_ms / 1000.0
     pattern = re.compile(product_name_pattern) if product_name_pattern else None
@@ -966,9 +976,36 @@ async def monitor_shop_for_new_products(
     log.info("🔍 เริ่ม polling shop...")
     log.info("   ⏱️  Interval: %.2f วินาที", interval_sec)
     log.info("   🎯 Pattern: %s", product_name_pattern or "(ทุกสินค้า)")
+    print("\n💡 กดปุ่มใดก็ได้เพื่อหยุด polling และเลือกสินค้าด้วย arrow keys\n")
 
     while True:
         try:
+            # ตรวจจับ keyboard interrupt (Windows)
+            if sys.platform == 'win32' and msvcrt.kbhit():
+                msvcrt.getch()  # consume the key
+                log.info("⏸️  ตรวจพบการกดปุ่ม — หยุด polling ชั่วคราว")
+                print("\n⏸️  หยุด polling ชั่วคราว...\n")
+                
+                # fetch products ปัจจุบัน
+                current = await fetch_shop_products(shop_url, session_file)
+                if not current:
+                    print("❌ ไม่พบสินค้าในขณะนี้ — กลับไป polling\n")
+                    log.warning("ไม่พบสินค้า — กลับไป polling")
+                    await asyncio.sleep(1)
+                    continue
+                
+                # แสดง interactive menu
+                print(f"📦 พบสินค้าทั้งหมด: {len(current)} รายการ\n")
+                selected = await select_product_interactive(current)
+                
+                print(f"\n✅ เลือก: \033[96m{selected['name']}\033[0m")
+                print(f"   ID: {selected['id']}")
+                print(f"   URL: {selected['url']}\n")
+                log.info("✅ เลือกสินค้า: %s", selected["name"])
+                log.info("   ID: %d", selected["id"])
+                log.info("   URL: %s", selected["url"])
+                return selected
+            
             poll_count += 1
             poll_time = datetime.now().strftime("%H:%M:%S.%f")[:-3]
             log.info("🔄 Poll #%d [%s] กำลังตรวจสอบร้าน...", poll_count, poll_time)
@@ -1020,6 +1057,26 @@ async def monitor_shop_for_new_products(
             log.warning("⚠️  Poll error: %s — ลองใหม่...", e)
 
         await asyncio.sleep(interval_sec)
+
+
+async def select_product_interactive(products: list[dict]) -> dict:
+    """แสดง interactive menu ให้เลือก product ด้วย arrow keys"""
+    try:
+        from pick import pick
+    except ImportError:
+        log.warning("⚠️  ไม่พบ 'pick' library — ติดตั้งด้วย: pip install pick")
+        log.warning("   ใช้สินค้าตัวแรกแทน")
+        return products[0]
+    
+    title = "🎯 เลือกสินค้าที่ต้องการ checkout (ใช้ ↑↓ เลือก, Enter ยืนยัน):"
+    options = [f"[{p['id']}] {p['name']}" for p in products]
+    
+    try:
+        selected_text, index = pick(options, title, indicator="→")
+        return products[index]
+    except (KeyboardInterrupt, Exception) as e:
+        log.warning("⚠️  ยกเลิกการเลือก: %s — ใช้สินค้าตัวแรก", e)
+        return products[0]
 
 
 # ==================== CHECKOUT HELPERS ====================
@@ -1296,6 +1353,7 @@ async def run(config: dict) -> None:
         check_interval_ms = int(config.get("check_interval_ms", 500))
         session_file = config.get("session_file", "line_session.json")
         product_name_pattern = config.get("product_name_pattern")
+        force_polling = bool(config.get("force_polling", False))
         auto_pick_first_variant = config.get("auto_pick_first_variant", True)
         prewarm_browser = config.get("prewarm_browser", False)
         quantity = int(config.get("quantity", 1))
@@ -1351,6 +1409,7 @@ async def run(config: dict) -> None:
             check_interval_ms=check_interval_ms,
             session_file=session_file,
             product_name_pattern=product_name_pattern,
+            force_polling=force_polling,
         )
 
         product_url = new_product["url"]
