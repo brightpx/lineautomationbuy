@@ -62,7 +62,7 @@ def build_checkout_url(shop_handle: str, product_id: int, variant_id: int, quant
         "items": [
             {
                 "productId": product_id,
-                "productVariantId": variant_id,
+                "productVariantId": variant_id,  # None จะกลายเป็น null ใน JSON
                 "quantity": quantity,
             }
         ]
@@ -792,53 +792,62 @@ async def run(config: dict) -> None:
     except Exception as e:
         log.warning("HTTP fetch ล้มเหลว: %s — จะเปิด browser แทน", e)
 
+    # ถ้าไม่มี variants หรือมีแค่ variant เดียว → ข้ามการเลือก
     if not variants:
-        log.error("❌ ไม่สามารถดึง variants ได้จาก HTTP")
-        return
+        log.warning("⚠️ ไม่พบ variants — ข้ามขั้นตอนเลือก variant")
+        # ส่ง variant_id = None (จะกลายเป็น null ใน JSON)
+        matched_variant = {"id": None, "name": "default", "available": 1}
+        matched_size = "default"
+    elif len(variants) == 1:
+        # มี variant เดียว → เลือกอัตโนมัติ
+        matched_variant = variants[0]
+        matched_size = matched_variant["name"]
+        log.info("📦 Variant เดียว: %s (ID: %d) — เลือกอัตโนมัติ", matched_size, matched_variant["id"])
+    else:
+        # มีหลาย variants → ต้องเลือก
+        variant_names = [v['name'] for v in variants]
+        log.info("📦 Variants (%d): %s", len(variants), ', '.join(variant_names))
 
-    variant_names = [v['name'] for v in variants]
-    log.info("📦 Variants (%d): %s", len(variants), ', '.join(variant_names))
-
-    # ── ขั้นที่ 2: หา variant ที่ตรง size ──
-    check_interval = config.get("check_interval_seconds", 30)
-    
-    while True:
-        matched_variant: dict | None = None
-        matched_size: str = ""
+        # ── ขั้นที่ 2: หา variant ที่ตรง size ──
+        check_interval = config.get("check_interval_seconds", 30)
         
-        for size in preferred_sizes:
-            for v in variants:
-                if v["name"].strip().lower() == size.strip().lower():
-                    matched_variant = v
-                    matched_size = size
-                    break
-            if matched_variant:
-                break
-
-        if not matched_variant:
-            log.error("❌ ไม่พบ size %s ในรายการ variants", preferred_sizes)
-            log.error("   Size ที่มีอยู่: %s", [v["name"] for v in variants])
-            return
-
-        # ตรวจสอบสต็อก
-        stock = matched_variant.get("available", 0)
-        
-        if stock > 0:
-            log.info("✅ เลือก: %s (ID: %d) — มีสต็อก: %d", matched_size, matched_variant["id"], stock)
-            break
-        else:
-            log.warning("⏳ Size '%s' หมดสต็อก — รอตรวจสอบอีกครั้งใน %d วินาที...", matched_size, check_interval)
-            await asyncio.sleep(check_interval)
+        while True:
+            matched_variant: dict | None = None
+            matched_size: str = ""
             
-            # ดึง variants ใหม่
-            try:
-                variants = await fetch_variants_via_http(product_url, product_id, session_file)
-                if not variants:
-                    log.error("❌ ไม่สามารถดึง variants ได้ — หยุดการตรวจสอบ")
-                    return
-            except Exception as e:
-                log.warning("HTTP fetch ล้มเหลว: %s — ข้ามรอบนี้", e)
-                continue
+            for size in preferred_sizes:
+                for v in variants:
+                    if v["name"].strip().lower() == size.strip().lower():
+                        matched_variant = v
+                        matched_size = size
+                        break
+                if matched_variant:
+                    break
+
+            if not matched_variant:
+                log.error("❌ ไม่พบ size %s ในรายการ variants", preferred_sizes)
+                log.error("   Size ที่มีอยู่: %s", [v["name"] for v in variants])
+                return
+
+            # ตรวจสอบสต็อก
+            stock = matched_variant.get("available", 0)
+            
+            if stock > 0:
+                log.info("✅ เลือก: %s (ID: %d) — มีสต็อก: %d", matched_size, matched_variant["id"], stock)
+                break
+            else:
+                log.warning("⏳ Size '%s' หมดสต็อก — รอตรวจสอบอีกครั้งใน %d วินาที...", matched_size, check_interval)
+                await asyncio.sleep(check_interval)
+                
+                # ดึง variants ใหม่
+                try:
+                    variants = await fetch_variants_via_http(product_url, product_id, session_file)
+                    if not variants:
+                        log.error("❌ ไม่สามารถดึง variants ได้ — หยุดการตรวจสอบ")
+                        return
+                except Exception as e:
+                    log.warning("HTTP fetch ล้มเหลว: %s — ข้ามรอบนี้", e)
+                    continue
 
     # ── ขั้นที่ 3: สร้าง Checkout URL ──
     checkout_url = build_checkout_url(
@@ -891,21 +900,34 @@ async def run(config: dict) -> None:
         # ── ขั้นที่ 6: ดึงราคาจริงจากหน้า checkout ──
         actual_price = ""
         try:
-            await page.wait_for_timeout(500)
+            await page.wait_for_timeout(1000)
             
-            all_prices = await page.locator('text=/฿\\s*[0-9,]+/').all_text_contents()
+            import re
             
-            max_price = 0
-            for price_text in all_prices:
-                import re
-                match = re.search(r'฿?\s*([0-9,]+)', price_text)
-                if match:
-                    price_val = int(match.group(1).replace(',', ''))
-                    if price_val > max_price:
-                        max_price = price_val
+            # DEBUG: dump HTML เพื่อตรวจสอบ
+            html_content = await page.content()
+            with open("debug_checkout_price.html", "w", encoding="utf-8") as f:
+                f.write(html_content)
+            log.info("📝 Dump HTML to debug_checkout_price.html")
             
-            if max_price > 0:
-                actual_price = str(max_price)
+            # หาราคาทั้งหมดที่มีในหน้า
+            all_prices = re.findall(r'฿\s*([0-9,]+(?:\.[0-9]{2})?)', html_content)
+            price_values = []
+            for p in all_prices:
+                val_str = p.replace(',', '')
+                val = int(float(val_str)) if '.' in val_str else int(val_str)
+                price_values.append(val)
+            
+            log.info("🔍 ราคาทั้งหมดในหน้า (raw): %s", sorted(set(price_values), reverse=True))
+            
+            # กรองเฉพาะราคาที่มีนัยสำคัญ (≥100)
+            significant_prices = sorted([p for p in set(price_values) if p >= 100], reverse=True)
+            log.info("💰 ราคาที่ ≥100: %s", significant_prices)
+            
+            if significant_prices:
+                actual_price = str(significant_prices[0])
+                log.info("✅ เลือกราคา: ฿%s", actual_price)
+                
         except Exception as e:
             log.warning("ไม่สามารถดึงราคาจากหน้า checkout: %s", e)
 

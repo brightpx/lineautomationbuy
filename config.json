@@ -1,6 +1,6 @@
 {
   "product_url": "https://shop.line.me/@be_bekids/product/1008243591",
-  "preferred_sizes": ["18-24m"],
+  "preferred_sizes": ["2-3y"],
   "check_interval_seconds": 1,
   "headless": true,
   "session_file": "line_session.json"
