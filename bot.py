@@ -22,8 +22,8 @@ def load_config() -> dict:
         # สร้าง config เริ่มต้นถ้ายังไม่มี
         default_config = {
             "product_url": "https://shop.line.me/@thelandofvava/product/1008229723",
-            "preferred_sizes": ["2y"],
-            "check_interval": 5,
+            "preferred_1": ["2y"],
+            "check_interval_seconds": 5,
             "headless": False,
             "session_file": "line_session.json",
             "is_test": False,
@@ -834,7 +834,7 @@ async def select_promptpay(page: Page, debug_screenshots: bool = False) -> bool:
         return False
 
 
-async def monitor_and_buy(playwright, product_url: str, preferred_sizes: list[str],
+async def monitor_and_buy(playwright, product_url: str, preferred_options: list[str],
                           check_interval: int, session_file: str, headless: bool,
                           is_test: bool = False, debug_screenshots: bool = False) -> None:
     """วนตรวจสินค้าทุก CHECK_INTERVAL วินาที แล้วกดซื้อทันทีที่เปิดขาย"""
@@ -876,7 +876,7 @@ async def monitor_and_buy(playwright, product_url: str, preferred_sizes: list[st
     await page.route("**/*", block_resources)
 
     log.info("เริ่มตรวจสินค้า: %s", product_url)
-    log.info("ไซซ์ที่ต้องการ (ตามลำดับ): %s", preferred_sizes)
+    log.info("ตัวเลือกที่ต้องการ (ตามลำดับ): %s", preferred_options)
     if is_test:
         log.info("โหมดทดสอบ: จะหยุดที่หน้า checkout/cart (ไม่กด Place Order)")
 
@@ -910,12 +910,12 @@ async def monitor_and_buy(playwright, product_url: str, preferred_sizes: list[st
                 continue
 
             # สินค้าเปิดขาย — เช็คสต็อกโดยไม่ต้องโหลดหน้าใหม่
-            in_stock, available_size = await check_size_in_stock(page, preferred_sizes)
+            in_stock, available_size = await check_size_in_stock(page, preferred_options)
 
             if not in_stock:
                 sold_out_count += 1
-                log.info("[ครั้งที่ %d] ไซซ์ %s หมดทุกตัว — เช็คอีกครั้งในอีก %d วินาที",
-                        attempt, preferred_sizes, check_interval)
+                log.info("[ครั้งที่ %d] ตัวเลือก %s หมดทุกตัว — เช็คอีกครั้งในอีก %d วินาที",
+                        attempt, preferred_options, check_interval)
                 await asyncio.sleep(check_interval)
                 continue
 
@@ -927,7 +927,7 @@ async def monitor_and_buy(playwright, product_url: str, preferred_sizes: list[st
 
             # ส่ง modal ที่เปิดอยู่แล้วเข้า proceed_to_checkout เลย (ลด race condition)
             success, reason = await proceed_to_checkout(
-                page, preferred_sizes, debug_screenshots,
+                page, preferred_options, debug_screenshots,
                 modal_already_open=True, preselected_size=available_size
             )
 
@@ -1006,8 +1006,12 @@ async def main(mode: str = "buy") -> None:
 
     log.info("โหลดการตั้งค่าจาก %s", CONFIG_FILE)
     log.info("  - Product URL: %s", config["product_url"])
-    log.info("  - Preferred Sizes: %s", config["preferred_sizes"])
-    log.info("  - Check Interval: %d วินาที", config["check_interval"])
+    
+    # รองรับทั้ง key ใหม่ (preferred_1) และเก่า (preferred_sizes)
+    preferred = config.get("preferred_1") or config.get("preferred_sizes") or []
+    check_interval = config.get("check_interval_seconds") or config.get("check_interval") or 5
+    log.info("  - Preferred Options: %s", preferred)
+    log.info("  - Check Interval: %d วินาที", check_interval)
     log.info("  - Headless: %s", config["headless"])
     log.info("  - Test Mode: %s", config.get("is_test", False))
     log.info("  - Debug Screenshots: %s", config.get("debug_screenshots", False))
@@ -1016,11 +1020,14 @@ async def main(mode: str = "buy") -> None:
         if mode == "login":
             await do_login(pw, config["session_file"])
         else:
+            # รองรับทั้ง key ใหม่และเก่า
+            preferred = config.get("preferred_1") or config.get("preferred_sizes") or []
+            check_interval = config.get("check_interval_seconds") or config.get("check_interval") or 5
             await monitor_and_buy(
                 pw,
                 product_url=config["product_url"],
-                preferred_sizes=config["preferred_sizes"],
-                check_interval=config["check_interval"],
+                preferred_options=preferred,
+                check_interval=check_interval,
                 session_file=config["session_file"],
                 headless=config["headless"],
                 is_test=config.get("is_test", False),

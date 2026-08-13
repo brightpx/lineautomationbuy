@@ -1,7 +1,7 @@
 """
 LINE Shopping — Direct Checkout Script
 ---------------------------------------
-1. อ่าน config.json  (product_url + preferred_sizes)
+1. อ่าน config.json  (product_url + preferred_1/preferred_2)
 2. เปิดหน้า product พร้อม intercept ทุก network response / script tag
 3. ดึง productVariants จาก API JSON response ที่ URL มี productId ก่อน
 4. ถ้าไม่ได้จาก API → scan script tags → window.__NUXT__ (กรองตาม productId)
@@ -12,8 +12,10 @@ import asyncio
 import json
 import logging
 import re
+import time
 import urllib.parse
 from pathlib import Path
+from typing import Any, Callable, Optional
 
 import httpx
 from playwright.async_api import async_playwright, Page, Response, TimeoutError as PWTimeout
@@ -56,53 +58,244 @@ def parse_shop_handle(product_url: str) -> str:
     raise ValueError(f"ไม่พบ shop handle ใน URL: {product_url}")
 
 
-def build_checkout_url(shop_handle: str, product_id: int, variant_id: int, quantity: int = 1) -> str:
-    """สร้าง Checkout URL พร้อม URL-encoded JSON"""
-    data = {
+# ==================== CHECKOUT URL BUILDER ====================
+
+CHECKOUT_ENCODING_MODES = ("auto", "full", "quote_only", "none")
+
+
+def build_checkout_payload(
+    product_id: int,
+    variant_id: Optional[int] = None,
+    quantity: int = 1,
+) -> dict:
+    """
+    สร้าง payload dict สำหรับ query string `data` ของ LINE Shopping checkout
+
+    variant_id = None  → productVariantId: null  (สินค้าไม่มี variant)
+    """
+    if quantity is None or int(quantity) < 1:
+        quantity = 1
+    return {
         "items": [
             {
-                "productId": product_id,
-                "productVariantId": variant_id,  # None จะกลายเป็น null ใน JSON
-                "quantity": quantity,
+                "productId": int(product_id),
+                "productVariantId": int(variant_id) if variant_id is not None else None,
+                "quantity": int(quantity),
             }
         ]
     }
-    encoded = urllib.parse.quote(json.dumps(data, separators=(",", ":")), safe="")
-    return f"https://shop.line.me/{shop_handle}/checkout/cart?data={encoded}"
+
+
+def _resolve_encoding_mode(mode: Optional[str], variant_id: Optional[int]) -> str:
+    """
+    แปลง encoding_mode → mode จริงที่จะใช้
+
+    auto:
+      - ไม่มี variant (productVariantId = null) → full   (ตรงกับ pattern ที่ LINE ส่งจริง)
+      - มี variant                              → quote_only
+    """
+    normalized = (mode or "auto").strip().lower()
+    if normalized in ("full", "quote_only", "none"):
+        return normalized
+    if normalized not in CHECKOUT_ENCODING_MODES:
+        log.warning("checkout_encoding='%s' ไม่รู้จัก — ใช้ 'auto'", mode)
+    return "full" if variant_id is None else "quote_only"
+
+
+def encode_checkout_data(
+    payload: dict,
+    encoding_mode: str = "auto",
+    variant_id: Optional[int] = None,
+) -> str:
+    """
+    encode payload → string สำหรับใส่หลัง ?data=
+
+    full       : %7B%22items%22%3A%5B...  (encode ทุกตัวอักษรพิเศษ)
+    quote_only : {%22items%22:[{...}]}    (encode เฉพาะ " — { } [ ] : , ปล่อยไว้)
+    none       : {"items":[{...}]}        (raw JSON)
+    """
+    raw = json.dumps(payload, separators=(",", ":"), ensure_ascii=False)
+    mode = _resolve_encoding_mode(encoding_mode, variant_id)
+
+    if mode == "none":
+        return raw
+    if mode == "quote_only":
+        # encode เฉพาะอักขระที่ browser/LINE ต้องการจริง ๆ — คง { } [ ] : , ไว้
+        safe_chars = "{}[]:,-_.~*'()!$&+;=/?@"
+        return urllib.parse.quote(raw, safe=safe_chars)
+    return urllib.parse.quote(raw, safe="")
+
+
+def build_checkout_url(
+    shop_handle: str,
+    product_id: int,
+    variant_id: Optional[int] = None,
+    quantity: int = 1,
+    encoding_mode: str = "auto",
+) -> str:
+    """
+    คืน URL string เท่านั้น (ไม่ใช่ HTML <a>)
+    เช่น https://shop.line.me/@shop/checkout/cart?data=...
+    """
+    handle = shop_handle if shop_handle.startswith("@") else f"@{shop_handle}"
+    payload = build_checkout_payload(product_id, variant_id, quantity)
+    encoded = encode_checkout_data(payload, encoding_mode, variant_id)
+    return f"https://shop.line.me/{handle}/checkout/cart?data={encoded}"
+
+
+def build_checkout_url_candidates(
+    shop_handle: str,
+    product_id: int,
+    variant_id: Optional[int] = None,
+    quantity: int = 1,
+    encoding_mode: str = "auto",
+) -> list[str]:
+    """
+    คืน list ของ URL ทุก encoding mode โดยเรียง mode ที่เลือกไว้ก่อน
+    ใช้เป็น fallback ถ้า mode แรก LINE ไม่รับ
+    """
+    primary = _resolve_encoding_mode(encoding_mode, variant_id)
+    order = [primary] + [m for m in ("full", "quote_only", "none") if m != primary]
+    urls: list[str] = []
+    for mode in order:
+        url = build_checkout_url(shop_handle, product_id, variant_id, quantity, mode)
+        if url not in urls:
+            urls.append(url)
+    return urls
 
 
 # ==================== VARIANT EXTRACTION ====================
 
 def _dedup(variants: list[dict]) -> list[dict]:
-    seen: set[int] = set()
+    seen: set = set()
     out: list[dict] = []
     for v in variants:
-        if v["id"] not in seen:
-            seen.add(v["id"])
+        key = v["id"]
+        if key not in seen:
+            seen.add(key)
             out.append(v)
     return out
 
 
-def _extract_variant_list(obj) -> list[dict]:
+def normalize_variant(item: dict, resolve: Callable[[Any], Any] = lambda x: x) -> Optional[dict]:
     """
-    ดึง {id, name, available} จาก list ของ variant objects โดยตรง
-    รองรับ key: productVariants, variants, skus
-    available: จำนวนสต็อก (0 = หมด, >0 = มีของ)
+    แปลง dict ของ variant (จาก API หรือ __NUXT_DATA__ flat array) ให้เป็นรูปแบบมาตรฐาน:
+
+        {
+            "id": int | None,
+            "name": str,
+            "option1": str | None,   # ค่าตัวเลือกแรก เช่น สี
+            "option2": str | None,   # ค่าตัวเลือกสอง เช่น ขนาด
+            "available": int         # -1 = ไม่รู้ (ถือว่ามี), 0 = หมด, >0 = มีสต็อก
+        }
+
+    resolve: callable สำหรับ dereference ค่า index ใน Nuxt flat array
+             (ส่ง lambda x: arr[x] if isinstance(x,int) and x<len(arr) else x)
+             ถ้าไม่ได้ใช้ Nuxt flat mode → ส่ง lambda x: x (default)
     """
+    if not isinstance(item, dict):
+        return None
+
+    # ─── id ───────────────────────────────────────────────
+    raw_id = item.get("id") or item.get("productVariantId") or item.get("variantId")
+    resolved_id = resolve(raw_id) if raw_id is not None else None
+    if resolved_id is None:
+        return None
+    if not isinstance(resolved_id, (int, float)):
+        return None
+    variant_id = int(resolved_id)
+    if variant_id <= 0:
+        return None
+
+    # ─── option1 / option2 ────────────────────────────────
+    # ลำดับการหาค่า: field โดยตรงก่อน แล้ว resolve index
+    _option_keys1 = (
+        "variantOptionValue1", "optionValue1", "option1",
+        "color", "colour", "size", "selectedOption1",
+    )
+    _option_keys2 = (
+        "variantOptionValue2", "optionValue2", "option2",
+        "size", "selectedOption2",
+    )
+
+    def _pick_option(keys: tuple) -> Optional[str]:
+        for k in keys:
+            raw = item.get(k)
+            if raw is None:
+                continue
+            val = resolve(raw)
+            if isinstance(val, str) and val.strip():
+                return val.strip()
+            if isinstance(val, (int, float)) and val != resolved_id:
+                # เป็นค่าจำนวน ไม่ใช่ string → ข้าม
+                pass
+        return None
+
+    option1 = _pick_option(_option_keys1)
+    option2 = _pick_option(_option_keys2)
+
+    # ─── name ─────────────────────────────────────────────
+    raw_name = item.get("name") or item.get("variantName") or item.get("title")
+    resolved_name = resolve(raw_name) if raw_name is not None else None
+    if isinstance(resolved_name, str) and resolved_name.strip():
+        name = resolved_name.strip()
+    elif option1 and option2:
+        name = f"{option1} / {option2}"
+    elif option1:
+        name = option1
+    elif option2:
+        name = option2
+    else:
+        # ไม่มี name และไม่มี option → ไม่สามารถ normalize ได้
+        return None
+
+    # ถ้าได้ name แต่ยังไม่มี option → แยก name ออกเป็น option1/option2
+    if name and option1 is None and option2 is None:
+        # แยกด้วย " / ", " - ", " _ " เฉพาะเมื่อมีจำนวนพอดี 2 ส่วน
+        split_val: Optional[list[str]] = None
+        for sep in (" / ", " - ", "/", " _ "):
+            parts = [p.strip() for p in name.split(sep) if p.strip()]
+            if len(parts) == 2:
+                split_val = parts
+                break
+        if split_val:
+            option1, option2 = split_val
+
+    # ─── available ────────────────────────────────────────
+    raw_avail = item.get("available") or item.get("stock") or item.get("qty") or item.get("quantity")
+    if raw_avail is None:
+        available = -1   # ไม่รู้ → ถือว่ามีของ
+    else:
+        resolved_avail = resolve(raw_avail)
+        if isinstance(resolved_avail, (int, float)):
+            available = int(resolved_avail)
+        else:
+            available = -1
+
+    return {
+        "id": variant_id,
+        "name": name,
+        "option1": option1,
+        "option2": option2,
+        "available": available,
+    }
+
+
+def _extract_variant_list(
+    obj: Any,
+    resolve: Callable[[Any], Any] = lambda x: x,
+) -> list[dict]:
+    """
+    ดึง normalized variants จาก list ของ variant objects
+    รองรับสินค้า 0 / 1 / 2 variant options
+    """
+    if not isinstance(obj, list):
+        return []
     results: list[dict] = []
-    if isinstance(obj, list):
-        for item in obj:
-            if (
-                isinstance(item, dict)
-                and isinstance(item.get("id"), (int, float))
-                and isinstance(item.get("name"), str)
-                and item.get("name")
-            ):
-                results.append({
-                    "id": int(item["id"]),
-                    "name": str(item["name"]),
-                    "available": int(item.get("available", 0))
-                })
+    for item in obj:
+        v = normalize_variant(item, resolve)
+        if v is not None:
+            results.append(v)
     return results
 
 
@@ -112,38 +305,49 @@ def find_product_variants(obj, product_id: int, depth: int = 0, max_depth: int =
     1. หา dict ที่มี 'id' == product_id ก่อน
     2. ดึง productVariants / variants / skus จาก dict นั้น
     3. ถ้าไม่พบ context ที่ตรง → fallback ค้นหา productVariants key ทั่วไป
+    รองรับ 0 / 1 / 2 variant options ผ่าน normalize_variant()
     """
     if depth > max_depth:
         return []
 
+    _VARIANT_KEYS = ("productVariants", "variants", "skus")
+
     if isinstance(obj, dict):
-        # ถ้า dict นี้คือ product object ที่เราต้องการ
         obj_id = obj.get("id") or obj.get("productId")
-        if obj_id and int(obj_id) == product_id:
-            for key in ("productVariants", "variants", "skus", "options"):
-                if key in obj and isinstance(obj[key], list):
-                    found = _extract_variant_list(obj[key])
+        if obj_id is not None:
+            try:
+                obj_id_int = int(obj_id)
+            except (ValueError, TypeError):
+                obj_id_int = -1
+
+            if obj_id_int == product_id:
+                # ตรงกับ product ที่ต้องการ — ดึง variant list จาก key ที่รู้จัก
+                for key in _VARIANT_KEYS:
+                    if key in obj and isinstance(obj[key], list):
+                        found = _extract_variant_list(obj[key])
+                        if found:
+                            return found
+                # variant ฝังลึกกว่า — ค้นต่อใน dict นี้
+                for v in obj.values():
+                    found = find_product_variants(v, product_id, depth + 1, max_depth)
                     if found:
                         return found
-            # อาจซ้อนอยู่ลึกกว่า — ค้นต่อใน dict นี้
-            for v in obj.values():
-                found = find_product_variants(v, product_id, depth + 1, max_depth)
-                if found:
-                    return found
 
-        # ค้นหา productVariants key ที่ลงไปอีก level
-        for key in ("productVariants", "variants", "skus"):
+        # รวบรวม fallback จาก key ที่รู้จัก (คืนผล fallback เฉพาะถ้าไม่พบ context ที่ดีกว่า)
+        fallback: list[dict] = []
+        for key in _VARIANT_KEYS:
             if key in obj and isinstance(obj[key], list):
-                found = _extract_variant_list(obj[key])
-                if found:
-                    log.debug("  พบ '%s' key ที่ depth=%d (id context ไม่ match)", key, depth)
-                    # เก็บไว้แต่อย่าคืนทันที — หา context ที่ดีกว่าก่อน
-                    pass
+                cands = _extract_variant_list(obj[key])
+                if cands:
+                    fallback.extend(cands)
 
         for v in obj.values():
             found = find_product_variants(v, product_id, depth + 1, max_depth)
             if found:
                 return found
+
+        if fallback:
+            return fallback
 
     elif isinstance(obj, list):
         for item in obj:
@@ -157,17 +361,22 @@ def find_product_variants(obj, product_id: int, depth: int = 0, max_depth: int =
 def find_variants_anywhere(obj, depth: int = 0, max_depth: int = 20) -> list[dict]:
     """
     Fallback ระดับ 1: ค้นหา productVariants/variants/skus key ทุกที่
+    กรอง id > 10000 เพื่อลด false positive
+    รองรับ 0 / 1 / 2 variant options ผ่าน normalize_variant()
     """
     if depth > max_depth:
         return []
 
+    _VARIANT_KEYS = ("productVariants", "variants", "skus")
     results: list[dict] = []
 
     if isinstance(obj, dict):
-        for key in ("productVariants", "variants", "skus"):
+        for key in _VARIANT_KEYS:
             if key in obj and isinstance(obj[key], list):
-                found = _extract_variant_list(obj[key])
-                results.extend(v for v in found if v["id"] > 10000)
+                for item in obj[key]:
+                    v = normalize_variant(item)
+                    if v is not None and v["id"] > 10000:
+                        results.append(v)
 
         for v in obj.values():
             results.extend(find_variants_anywhere(v, depth + 1, max_depth))
@@ -181,26 +390,18 @@ def find_variants_anywhere(obj, depth: int = 0, max_depth: int = 20) -> list[dic
 
 def _recursive_id_name_search(obj, depth: int = 0, max_depth: int = 20) -> list[dict]:
     """
-    Fallback ระดับ 2 (กว้างที่สุด): หา dict ที่มี 'id' (int) + 'name' (str) ทุกที่
-    เหมือน search_variants_in_obj เดิม — ใช้เมื่อ Nuxt serialize เป็น flat array
+    Fallback ระดับ 2 (กว้างที่สุด): หา dict ที่มี 'id' (int) + name/option ทุกที่
+    ใช้ normalize_variant() เพื่อรองรับ option1/option2
     """
     if depth > max_depth:
         return []
     results: list[dict] = []
     if isinstance(obj, dict):
-        if (
-            "id" in obj and "name" in obj
-            and isinstance(obj.get("id"), (int, float))
-            and isinstance(obj.get("name"), str)
-            and obj.get("name")
-        ):
-            results.append({
-                "id": int(obj["id"]),
-                "name": str(obj["name"]),
-                "available": int(obj.get("available", 0))
-            })
-        for v in obj.values():
-            results.extend(_recursive_id_name_search(v, depth + 1, max_depth))
+        v = normalize_variant(obj)
+        if v is not None:
+            results.append(v)
+        for val in obj.values():
+            results.extend(_recursive_id_name_search(val, depth + 1, max_depth))
     elif isinstance(obj, list):
         for item in obj:
             results.extend(_recursive_id_name_search(item, depth + 1, max_depth))
@@ -211,54 +412,39 @@ def parse_nuxt_flat_array(arr: list, product_id: int) -> list[dict]:
     """
     Nuxt serialize ข้อมูลเป็น flat array โดยค่าใน dict คือ INDEX ไปยัง element อื่น
     เช่น: {'id': 47, 'variantOptionValue1': 48, 'available': 49}  →  id=arr[47], name=arr[48], available=arr[49]
-    
-    ค้นหา dict ที่มี key 'id' และ 'variantOptionValue1' (pattern ของ LINE Shopping variant)
-    แล้ว dereference ค่าออกมา
+
+    ค้นหา dict ที่มี key 'id' และ variantOptionValue1/variantOptionValue2
+    แล้ว dereference ค่าออกมาผ่าน normalize_variant()
+    รองรับสินค้า 1 variant (มีเฉพาะ variantOptionValue1)
+    และสินค้า 2 variants (มีทั้ง variantOptionValue1 + variantOptionValue2)
     """
-    results: list[dict] = []
+    if not isinstance(arr, list):
+        return []
     n = len(arr)
 
+    def resolve(val: Any) -> Any:
+        """dereference index → ค่าจริง ถ้าไม่ใช่ index ที่ valid → คืนค่าเดิม"""
+        if isinstance(val, int) and 0 <= val < n:
+            return arr[val]
+        return val
+
+    results: list[dict] = []
     for item in arr:
         if not isinstance(item, dict):
             continue
-        # LINE Shopping variant object มี key เหล่านี้
-        if "id" not in item or "variantOptionValue1" not in item:
+        # ต้องมี 'id' และ variantOptionValue1 หรือ variantOptionValue2 อย่างน้อยหนึ่งอย่าง
+        has_id = "id" in item
+        has_opt = (
+            "variantOptionValue1" in item
+            or "variantOptionValue2" in item
+            or "optionValue1" in item
+        )
+        if not (has_id and has_opt):
             continue
 
-        id_ref = item.get("id")
-        name_ref = item.get("variantOptionValue1")
-        avail_ref = item.get("available")
-
-        # ต้องเป็น index (int) ที่ valid
-        if not isinstance(id_ref, int) or not isinstance(name_ref, int):
-            continue
-        if not (0 <= id_ref < n) or not (0 <= name_ref < n):
-            continue
-
-        actual_id = arr[id_ref]
-        actual_name = arr[name_ref]
-        
-        # dereference available (อาจเป็น direct value หรือ index)
-        actual_available = 0
-        if isinstance(avail_ref, int):
-            if 0 <= avail_ref < n:
-                # เป็น index
-                val = arr[avail_ref]
-                if isinstance(val, (int, float)):
-                    actual_available = int(val)
-                else:
-                    # avail_ref อาจเป็นค่าจริง
-                    actual_available = avail_ref
-            else:
-                # เป็นค่าจริง (ไม่ใช่ index)
-                actual_available = avail_ref
-
-        if isinstance(actual_id, (int, float)) and isinstance(actual_name, str) and actual_name:
-            results.append({
-                "id": int(actual_id),
-                "name": actual_name,
-                "available": actual_available
-            })
+        v = normalize_variant(item, resolve)
+        if v is not None:
+            results.append(v)
 
     return _dedup(results)
 
@@ -269,7 +455,8 @@ def extract_variants_from_json(data, product_id: int) -> list[dict]:
     0. Nuxt flat array dereference (LINE Shopping specific — __NUXT_DATA__)
     1. Context-aware: หา product object ที่ id == product_id แล้วดึง productVariants
     2. Key-based: ค้นหา productVariants/variants/skus key ทุกที่ (id > 10000)
-    3. Broad: ค้นหา {id, name} ทุกที่ แล้ว filter id > 10000
+    3. Broad: ค้นหา {id, name/option} ทุกที่ แล้ว filter id > 10000
+    รองรับ 0 / 1 / 2 variant options ผ่าน normalize_variant()
     """
     # ชั้น 0 — Nuxt flat array (LINE Shopping __NUXT_DATA__ pattern)
     if isinstance(data, list):
@@ -289,8 +476,88 @@ def extract_variants_from_json(data, product_id: int) -> list[dict]:
 
     # ชั้น 3 — broad fallback
     found = _recursive_id_name_search(data)
-    found = [v for v in found if v["id"] > 10000]
+    found = [v for v in found if v["id"] is not None and v["id"] > 10000]
     return _dedup(found)
+
+
+# ==================== MATCHING ENGINE ====================
+
+
+def find_matching_variant(
+    variants: list[dict],
+    preferred_1: Optional[list[str]] = None,
+    preferred_2: Optional[list[str]] = None,
+) -> Optional[dict]:
+    """
+    หา variant ที่ตรงกับ preferred_1 และ/หรือ preferred_2
+
+    ลำดับความสำคัญ:
+      1. option1 + option2 match ทั้งคู่   (pref1+pref2 หรือ pref2+pref1)
+      2. name match ทั้ง pref1 และ pref2    (fallback สำหรับ name compound)
+      3. option1 หรือ option2 match pref1 only
+      4. option1 หรือ option2 match pref2 only
+      5. name match สำหรับ pref1 หรือ pref2 อย่างใดอย่างหนึ่ง
+
+    เปรียบเทียบแบบ case-insensitive, trim whitespace
+    Config เก่าที่มี preferred_sizes/preferred_colors ยังใช้งานได้ (backward-compatible)
+    """
+    if not variants:
+        return None
+
+    pref1 = [c.strip().lower() for c in (preferred_1 or []) if c]
+    pref2 = [s.strip().lower() for s in (preferred_2 or []) if s]
+
+    def _match_val(val: Optional[str], targets: list[str]) -> bool:
+        if not val or not targets:
+            return False
+        v = val.strip().lower()
+        return any(t == v for t in targets)
+
+    def _match_name(name: str, targets: list[str]) -> bool:
+        if not name or not targets:
+            return False
+        n = name.strip().lower()
+        return any(t in n or n == t for t in targets)
+
+    # ลำดับที่ 1: option1 + option2 ทั้งคู่ (ลอง pref1=opt1/pref2=opt2 และ pref1=opt2/pref2=opt1)
+    if pref1 and pref2:
+        for v in variants:
+            c1 = _match_val(v.get("option1"), pref1)
+            s2 = _match_val(v.get("option2"), pref2)
+            if c1 and s2:
+                return v
+        for v in variants:
+            s1 = _match_val(v.get("option1"), pref2)
+            c2 = _match_val(v.get("option2"), pref1)
+            if s1 and c2:
+                return v
+
+    # ลำดับที่ 2: name ประกอบด้วยทั้ง pref1 และ pref2
+    if pref1 and pref2:
+        for v in variants:
+            name = v.get("name", "")
+            if _match_name(name, pref1) and _match_name(name, pref2):
+                return v
+
+    # ลำดับที่ 3: pref1 only (option1 หรือ option2 หรือ name)
+    if pref1:
+        for v in variants:
+            if _match_val(v.get("option1"), pref1) or _match_val(v.get("option2"), pref1):
+                return v
+        for v in variants:
+            if _match_name(v.get("name", ""), pref1):
+                return v
+
+    # ลำดับที่ 4: pref2 only (option1 หรือ option2 หรือ name)
+    if pref2:
+        for v in variants:
+            if _match_val(v.get("option1"), pref2) or _match_val(v.get("option2"), pref2):
+                return v
+        for v in variants:
+            if _match_name(v.get("name", ""), pref2):
+                return v
+
+    return None
 
 
 async def get_variants_from_page(page: Page, product_id: int) -> list[dict]:
@@ -759,102 +1026,157 @@ async def select_promptpay(page: Page) -> bool:
 
 async def run(config: dict) -> None:
     product_url: str = config["product_url"]
-    sizes_raw = config.get("preferred_sizes") or config.get("size") or []
-    preferred_sizes: list[str] = [sizes_raw] if isinstance(sizes_raw, str) else list(sizes_raw)
-    headless: bool = config.get("headless", False)
-    session_file: str = config.get("session_file", "line_session.json")
+    quantity: int = int(config.get("quantity", 1))
 
-    if not preferred_sizes:
-        raise ValueError("ต้องระบุ preferred_sizes หรือ size ใน config.json")
+    # ── preferred_1 / preferred_2 (backward-compatible with old keys) ──
+    pref1_raw = (
+        config.get("preferred_1")
+        or config.get("preferred_sizes")
+        or config.get("size")
+        or []
+    )
+    preferred_1: list[str] = (
+        [pref1_raw] if isinstance(pref1_raw, str) else list(pref1_raw)
+    )
+    pref2_raw = (
+        config.get("preferred_2")
+        or config.get("preferred_colors")
+        or config.get("color")
+        or []
+    )
+    preferred_2: list[str] = (
+        [pref2_raw] if isinstance(pref2_raw, str) else list(pref2_raw)
+    )
+
+    headless: bool = bool(config.get("headless", False))           # Bug B fix
+    session_file: str = config.get("session_file", "line_session.json")
+    encoding_mode: str = config.get("checkout_encoding", "auto")
+    check_interval: int = int(config.get("check_interval_seconds", 30))
+    max_stock_checks: int = int(config.get("max_stock_checks", 120))  # Bug C fix
+    auto_confirm: bool = bool(config.get("auto_confirm", False))
 
     product_id = parse_product_id(product_url)
     shop_handle = parse_shop_handle(product_url)
 
     log.info("🛍️  Product: %s (ID: %d)", shop_handle, product_id)
-    log.info("📏 Sizes: %s", preferred_sizes)
+    if preferred_1:
+        log.info("🔹 Preferred #1: %s", preferred_1)
+    if preferred_2:
+        log.info("🔹 Preferred #2: %s", preferred_2)
 
-    # ── ขั้นที่ 1: ดึง product info และ variants ผ่าน HTTP (ไม่เปิด browser) ──
+    # ── ขั้นที่ 1: ดึง product info และ variants ผ่าน HTTP ──
     variants: list[dict] = []
     product_info: dict = {}
     try:
-        variants = await fetch_variants_via_http(product_url, product_id, session_file)
-        product_info = await fetch_product_info(product_url, session_file)
+        variants, product_info = await asyncio.gather(
+            fetch_variants_via_http(product_url, product_id, session_file),
+            fetch_product_info(product_url, session_file),
+        )
     except Exception as e:
-        log.warning("HTTP fetch ล้มเหลว: %s — จะเปิด browser แทน", e)
+        log.warning("HTTP fetch ล้มเหลว: %s", e)
 
-    # ถ้าไม่มี variants หรือมีแค่ variant เดียว → ข้ามการเลือก
+    # ── ขั้นที่ 2: เลือก variant ──
+    matched_variant: Optional[dict] = None
+    matched_label: str = "default"
+
     if not variants:
-        log.warning("⚠️ ไม่พบ variants — ข้ามขั้นตอนเลือก variant")
-        # ส่ง variant_id = None (จะกลายเป็น null ใน JSON)
-        matched_variant = {"id": None, "name": "default", "available": 1}
-        matched_size = "default"
+        # 0 variant: สินค้าไม่มีตัวเลือก → productVariantId = null
+        log.info("📦 ไม่มี variant — checkout โดยตรง (productVariantId=null)")
+        matched_variant = {"id": None, "name": "default", "option1": None, "option2": None, "available": -1}
+        matched_label = "default"
+
     elif len(variants) == 1:
-        # มี variant เดียว → เลือกอัตโนมัติ
+        # 1 variant: เลือกอัตโนมัติ ไม่ว่าสต็อกจะเป็นเท่าไร
         matched_variant = variants[0]
-        matched_size = matched_variant["name"]
-        log.info("📦 Variant เดียว: %s (ID: %d) — เลือกอัตโนมัติ", matched_size, matched_variant["id"])
+        matched_label = matched_variant["name"]
+        vid = matched_variant["id"]
+        log.info(
+            "📦 Variant เดียว: %s (ID: %s) — เลือกอัตโนมัติ",
+            matched_label, vid if vid is not None else "null",
+        )
+
     else:
-        # มีหลาย variants → ต้องเลือก
-        variant_names = [v['name'] for v in variants]
-        log.info("📦 Variants (%d): %s", len(variants), ', '.join(variant_names))
+        # 2+ variants: ต้องหา variant ที่ตรงกับ preferred_1 / preferred_2
+        variant_names = [v["name"] for v in variants]
+        log.info("📦 Variants (%d): %s", len(variants), ", ".join(variant_names))
 
-        # ── ขั้นที่ 2: หา variant ที่ตรง size ──
-        check_interval = config.get("check_interval_seconds", 30)
-        
-        while True:
-            matched_variant: dict | None = None
-            matched_size: str = ""
-            
-            for size in preferred_sizes:
-                for v in variants:
-                    if v["name"].strip().lower() == size.strip().lower():
-                        matched_variant = v
-                        matched_size = size
-                        break
-                if matched_variant:
-                    break
+        if not preferred_1 and not preferred_2:
+            log.error(
+                "❌ สินค้ามี %d variants แต่ไม่ได้ระบุ preferred_1 หรือ preferred_2",
+                len(variants),
+            )
+            log.error("   Variants ที่มี: %s", variant_names)
+            return
 
-            if not matched_variant:
-                log.error("❌ ไม่พบ size %s ในรายการ variants", preferred_sizes)
-                log.error("   Size ที่มีอยู่: %s", [v["name"] for v in variants])
+        # ── stock-check loop พร้อม max_stock_checks ──
+        checks_done = 0
+        while checks_done < max_stock_checks:
+            candidate = find_matching_variant(variants, preferred_1, preferred_2)
+
+            if candidate is None:
+                log.error("❌ ไม่พบ variant ที่ตรงกับ pref1=%s pref2=%s", preferred_1, preferred_2)
+                log.error("   Variants ที่มี: %s", [v["name"] for v in variants])
                 return
 
-            # ตรวจสอบสต็อก
-            stock = matched_variant.get("available", 0)
-            
-            if stock > 0:
-                log.info("✅ เลือก: %s (ID: %d) — มีสต็อก: %d", matched_size, matched_variant["id"], stock)
+            stock = candidate.get("available", -1)
+            # available == -1 หมายถึงไม่ทราบสต็อก → ถือว่ามีของ
+            if stock != 0:
+                matched_variant = candidate
+                matched_label = candidate["name"]
+                vid = candidate["id"]
+                log.info(
+                    "✅ เลือก: %s (ID: %s) สต็อก: %s",
+                    matched_label,
+                    vid if vid is not None else "null",
+                    "ไม่ทราบ" if stock == -1 else str(stock),
+                )
                 break
-            else:
-                log.warning("⏳ Size '%s' หมดสต็อก — รอตรวจสอบอีกครั้งใน %d วินาที...", matched_size, check_interval)
-                await asyncio.sleep(check_interval)
-                
-                # ดึง variants ใหม่
-                try:
-                    variants = await fetch_variants_via_http(product_url, product_id, session_file)
-                    if not variants:
-                        log.error("❌ ไม่สามารถดึง variants ได้ — หยุดการตรวจสอบ")
-                        return
-                except Exception as e:
-                    log.warning("HTTP fetch ล้มเหลว: %s — ข้ามรอบนี้", e)
-                    continue
+
+            checks_done += 1
+            remaining = max_stock_checks - checks_done
+            log.warning(
+                "⏳ '%s' หมดสต็อก — รอ %d วินาที... (เหลือ %d ครั้ง)",
+                candidate["name"], check_interval, remaining,
+            )
+            if remaining <= 0:
+                log.error("❌ หมดจำนวนครั้งตรวจสต็อก (%d) — หยุด", max_stock_checks)
+                return
+
+            await asyncio.sleep(check_interval)
+
+            # ดึง variants ใหม่
+            try:
+                variants = await fetch_variants_via_http(product_url, product_id, session_file)
+                if not variants:
+                    log.error("❌ ดึง variants ไม่ได้ — หยุด")
+                    return
+            except Exception as fetch_err:
+                log.warning("HTTP fetch ล้มเหลว: %s — ข้ามรอบนี้", fetch_err)
+                continue
+
+        if matched_variant is None:
+            return
 
     # ── ขั้นที่ 3: สร้าง Checkout URL ──
+    variant_id_for_url = matched_variant["id"]
     checkout_url = build_checkout_url(
         shop_handle=shop_handle,
         product_id=product_id,
-        variant_id=matched_variant["id"],
+        variant_id=variant_id_for_url,
+        quantity=quantity,
+        encoding_mode=encoding_mode,
     )
+    log.info("🔗 Checkout URL: %s", checkout_url)
 
-    # ── ขั้นที่ 4: เปิด browser (headless) และทำ checkout โดยอัตโนมัติ ──
+    # ── ขั้นที่ 4: เปิด browser ──
     session_kwargs: dict = {}
     if Path(session_file).exists():
         session_kwargs["storage_state"] = session_file
 
-    log.info("🌐 เปิด browser...")
+    log.info("🌐 เปิด browser (headless=%s)...", headless)
     async with async_playwright() as pw:
         browser = await pw.chromium.launch(
-            headless=True,
+            headless=headless,                                       # Bug B fix
             args=[
                 "--disable-extensions",
                 "--disable-default-apps",
@@ -865,19 +1187,22 @@ async def run(config: dict) -> None:
             ],
         )
         context = await browser.new_context(**session_kwargs)
-        
+
         # Block unnecessary resources for faster page load
-        await context.route("**/*", lambda route: (
-            route.abort() if route.request.resource_type in ["image", "font", "media", "stylesheet"]
-            else route.continue_()
-        ))
-        
+        await context.route(
+            "**/*",
+            lambda route: (
+                route.abort()
+                if route.request.resource_type in ["image", "font", "media", "stylesheet"]
+                else route.continue_()
+            ),
+        )
+
         page = await context.new_page()
-        page.set_default_timeout(5000)
+        page.set_default_timeout(5_000)
 
         await page.goto(checkout_url, wait_until="domcontentloaded", timeout=15_000)
-        log.info("✅ ถึงหน้า checkout")
-        log.info("🔗 URL: %s", page.url)
+        log.info("✅ ถึงหน้า checkout — %s", page.url)
 
         # ── ขั้นที่ 5: เลือก PromptPay ──
         paid = await select_promptpay(page)
@@ -898,54 +1223,48 @@ async def run(config: dict) -> None:
         # ── ขั้นที่ 6: ดึงราคาจริงจากหน้า checkout ──
         actual_price = ""
         try:
-            import re
-            
-            # DEBUG: dump HTML เพื่อตรวจสอบ
             html_content = await page.content()
             with open("debug_checkout_price.html", "w", encoding="utf-8") as f:
                 f.write(html_content)
-            log.info("📝 Dump HTML to debug_checkout_price.html")
-            
-            # หาราคาทั้งหมดที่มีในหน้า
-            all_prices = re.findall(r'฿\s*([0-9,]+(?:\.[0-9]{2})?)', html_content)
-            price_values = []
-            for p in all_prices:
-                val_str = p.replace(',', '')
-                val = int(float(val_str)) if '.' in val_str else int(val_str)
-                price_values.append(val)
-            
-            log.info("🔍 ราคาทั้งหมดในหน้า (raw): %s", sorted(set(price_values), reverse=True))
-            
-            # กรองเฉพาะราคาที่มีนัยสำคัญ (≥100)
-            significant_prices = sorted([p for p in set(price_values) if p >= 100], reverse=True)
-            log.info("💰 ราคาที่ ≥100: %s", significant_prices)
-            
-            if significant_prices:
-                actual_price = str(significant_prices[0])
-                log.info("✅ เลือกราคา: ฿%s", actual_price)
-                
-        except Exception as e:
-            log.warning("ไม่สามารถดึงราคาจากหน้า checkout: %s", e)
+            log.info("📝 Dump HTML → debug_checkout_price.html")
 
-        # ── ขั้นที่ 7: แสดงข้อมูลและรอยืนยันก่อน Place Order ──
+            all_prices = re.findall(r"฿\s*([0-9,]+(?:\.[0-9]{2})?)", html_content)
+            price_values: list[int] = []
+            for p in all_prices:
+                val_str = p.replace(",", "")
+                price_values.append(int(float(val_str)) if "." in val_str else int(val_str))
+
+            log.info("🔍 ราคาทั้งหมด (raw): %s", sorted(set(price_values), reverse=True))
+            significant = sorted([p for p in set(price_values) if p >= 100], reverse=True)
+            log.info("💰 ราคา ≥100: %s", significant)
+
+            if significant:
+                actual_price = str(significant[0])
+                log.info("✅ ราคา: ฿%s", actual_price)
+        except Exception as price_err:
+            log.warning("ดึงราคาจาก checkout ไม่ได้: %s", price_err)
+
+        # ── ขั้นที่ 7: แสดงสรุป และรอยืนยัน ──
         print()
         print("=" * 60)
         print("📦 พร้อม Place Order")
         print("=" * 60)
         if product_info.get("name"):
-            print(f"สินค้า: {product_info['name']}")
-        if actual_price:
-            print(f"ราคา: ฿{actual_price}")
-        elif product_info.get("price"):
-            print(f"ราคา: ฿{product_info['price']}")
-        print(f"ตัวเลือก: {matched_size}")
-        print(f"จำนวน: 1")
-        print(f"ร้านค้า: {shop_handle}")
-        print(f"วิธีชำระเงิน: PromptPay")
+            print(f"สินค้า : {product_info['name']}")
+        display_price = actual_price or product_info.get("price", "")
+        if display_price:
+            print(f"ราคา   : ฿{display_price}")
+        print(f"ตัวเลือก: {matched_label}")
+        print(f"จำนวน  : {quantity}")
+        print(f"ร้านค้า : {shop_handle}")
+        print(f"ชำระเงิน: PromptPay")
         print("=" * 60)
         print()
 
-        response = input(">>> กด Enter เพื่อ Place Order หรือ Ctrl+C เพื่อยกเลิก: ")
+        if not auto_confirm:
+            await asyncio.to_thread(
+                input, ">>> กด Enter เพื่อ Place Order หรือ Ctrl+C เพื่อยกเลิก: "
+            )
 
         # ── ขั้นที่ 8: Place Order ──
         place_order_btn = page.locator(
@@ -955,103 +1274,85 @@ async def run(config: dict) -> None:
 
         try:
             url_before = page.url
-            
             await place_order_btn.click(timeout=5_000)
             log.info("🛒 กด Place Order...")
-            
-            # รอให้มีการ navigate หรือ response
+
             try:
                 await page.wait_for_load_state("networkidle", timeout=10_000)
             except Exception:
                 pass
-            
+
             url_after = page.url
-            
-            # ตรวจสอบว่า URL เปลี่ยนหรือไม่
+
             if url_before == url_after:
-                
-                # หา error messages (กรองคำที่ไม่ใช่ error)
+                # URL ไม่เปลี่ยน — ตรวจหา error message
+                ignore_texts = {"ดูทั้งหมด", "รวมทั้งหมด", "total", "view all", "see all"}
                 error_selectors = [
-                    'text=/error/i',
-                    'text=/ผิดพลาด/i',
+                    "text=/error/i",
+                    "text=/ผิดพลาด/i",
                     '[role="alert"]',
                     '[class*="error"]',
                     '[class*="Error"]',
                 ]
-                
-                # คำที่ไม่ใช่ error - ต้องกรองออก
-                ignore_texts = ['ดูทั้งหมด', 'รวมทั้งหมด', 'total', 'view all', 'see all']
-                
-                found_errors = []
+                found_errors: list[str] = []
                 for sel in error_selectors:
                     try:
-                        errors = await page.locator(sel).all_text_contents()
-                        if errors:
-                            # กรองเฉพาะข้อความที่ไม่ใช่คำทั่วไป
-                            filtered = [
-                                e.strip() for e in errors 
-                                if e.strip() and e.strip().lower() not in ignore_texts
-                            ]
-                            found_errors.extend(filtered)
+                        msgs = await page.locator(sel).all_text_contents()
+                        found_errors.extend(
+                            m.strip()
+                            for m in msgs
+                            if m.strip() and m.strip().lower() not in ignore_texts
+                        )
                     except Exception:
                         pass
-                
+
                 if found_errors:
                     log.error("❌ พบ error: %s", found_errors)
-                    print()
-                    print("=" * 60)
+                    print("\n" + "=" * 60)
                     print("❌ ไม่สามารถ Place Order ได้")
                     print("=" * 60)
                     for err in found_errors:
                         print(f"  • {err}")
-                    print("=" * 60)
-                    print()
+                    print("=" * 60 + "\n")
                 else:
-                    log.warning("ไม่พบ error message - แต่ URL ไม่เปลี่ยน")
-                
-                # ถ่าย screenshot เพื่อ debug
+                    log.warning("⚠️  URL ไม่เปลี่ยน และไม่พบ error message")
+
                 try:
                     await page.screenshot(path="debug_place_order_failed.png")
                     log.info("บันทึก screenshot: debug_place_order_failed.png")
                 except Exception:
                     pass
-                
-                # ปิด browser และจบโปรแกรม
-                log.info("ปิด browser")
-                await browser.close()
-                return
+
             else:
-                log.info("✅ URL เปลี่ยนแล้ว - น่าจะ submit สำเร็จ")
-                log.info("🔗 URL หลัง Place Order: %s", url_after)
-                
-                # ตรวจสอบว่าไป payment page หรือ success page หรือไม่
-                if "payment" in url_after or "success" in url_after or "order" in url_after:
+                log.info("✅ URL เปลี่ยน → %s", url_after)
+                if any(k in url_after for k in ("payment", "success", "order")):
                     log.info("✅ ไปหน้า payment/success/order แล้ว")
                 else:
-                    log.warning("⚠️ URL ไม่ใช่หน้า payment/success - ตรวจสอบ: %s", url_after)
-                
-        except Exception as e:
-            log.error("❌ กด Place Order ล้มเหลว: %s", e)
-            try:
-                await page.screenshot(path="debug_place_order_error.png")
-                log.info("บันทึก screenshot: debug_place_order_error.png")
-            except Exception:
-                pass
-                
+                    log.warning("⚠️  URL ไม่ใช่หน้า payment/success: %s", url_after)
+
                 # รอ QR code หรือ payment page
-                log.info("รอ QR code หรือ payment page...")
+                log.info("รอ QR code / payment page...")
                 try:
                     await page.wait_for_load_state("networkidle", timeout=5_000)
                 except Exception:
                     pass
-                
+
                 try:
                     await page.screenshot(path="debug_payment_page.png")
                     log.info("บันทึก screenshot: debug_payment_page.png")
                 except Exception:
                     pass
 
-        log.info("✅ เสร็จสิ้น - ปิด browser")
+        except Exception as place_err:
+            # Bug D fix: unreachable code ย้ายมาอยู่ใน except อย่างถูกต้อง
+            log.error("❌ กด Place Order ล้มเหลว: %s", place_err)
+            try:
+                await page.screenshot(path="debug_place_order_error.png")
+                log.info("บันทึก screenshot: debug_place_order_error.png")
+            except Exception:
+                pass
+
+        log.info("✅ เสร็จสิ้น — ปิด browser")
         await browser.close()
 
 
