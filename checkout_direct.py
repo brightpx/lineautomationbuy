@@ -14,11 +14,12 @@ import logging
 import re
 import time
 import urllib.parse
+from datetime import datetime, time as dt_time
 from pathlib import Path
 from typing import Any, Callable, Optional
 
 import httpx
-from playwright.async_api import async_playwright, Page, Response, TimeoutError as PWTimeout
+from playwright.async_api import async_playwright, Page, Response, TimeoutError as PWTimeout, Browser, BrowserContext
 
 # ==================== LOGGING ====================
 logging.basicConfig(
@@ -763,6 +764,264 @@ async def fetch_product_info(product_url: str, session_file: str) -> dict:
     return extract_product_info(html)
 
 
+# ==================== SHOP MONITOR MODE ====================
+
+def parse_sale_time(time_str: str) -> dt_time:
+    """แปลง sale_start_time string → datetime.time object
+    รองรับ HH:MM:SS, HH:MM, H:MM
+    """
+    parts = time_str.strip().split(":")
+    if len(parts) == 3:
+        h, m, s = int(parts[0]), int(parts[1]), int(parts[2])
+    elif len(parts) == 2:
+        h, m, s = int(parts[0]), int(parts[1]), 0
+    else:
+        raise ValueError(f"sale_start_time format ไม่ถูกต้อง: {time_str}")
+    return dt_time(h, m, s)
+
+
+async def fetch_shop_products(shop_url: str, session_file: str) -> list[dict]:
+    """
+    ดึงรายการสินค้าทั้งหมดจากหน้าร้าน (ใช้ Playwright เพื่อรอ JavaScript โหลด)
+    คืน list[{"id": int, "url": str, "name": str}]
+    """
+    from playwright.async_api import async_playwright
+    
+    products: list[dict] = []
+    shop_handle = parse_shop_handle(shop_url)
+    
+    async with async_playwright() as p:
+        browser = await p.chromium.launch(headless=True)
+        context = await browser.new_context()
+        
+        # Load session cookies if available
+        if Path(session_file).exists():
+            with open(session_file, encoding="utf-8") as f:
+                session = json.load(f)
+                if "cookies" in session:
+                    await context.add_cookies(session["cookies"])
+        
+        page = await context.new_page()
+        
+        try:
+            # Navigate and wait for network idle
+            await page.goto(shop_url, wait_until="networkidle", timeout=30000)
+            
+            # Wait for product cards to appear (or timeout after 5 seconds)
+            try:
+                await page.wait_for_selector('a[href*="/product/"]', timeout=5000)
+            except Exception:
+                log.debug("ไม่พบ product links ภายใน 5 วินาที")
+            
+            # Extract products from DOM
+            product_links = await page.query_selector_all('a[href*="/product/"]')
+            seen_ids: set[int] = set()
+            
+            for link in product_links:
+                try:
+                    href = await link.get_attribute('href')
+                    if not href:
+                        continue
+                    
+                    # Extract product ID from URL
+                    # Format: /@shop_handle/product/123456 or /product/123456
+                    m = re.search(r'/product/(\d+)', href)
+                    if not m:
+                        continue
+                    
+                    product_id = int(m.group(1))
+                    if product_id <= 10000 or product_id in seen_ids:
+                        continue
+                    
+                    # Get product name from link text or image alt
+                    name = await link.text_content() or ""
+                    name = name.strip()
+                    
+                    # If no text, try to get from img alt
+                    if not name:
+                        img = await link.query_selector('img')
+                        if img:
+                            name = await img.get_attribute('alt') or ""
+                            name = name.strip()
+                    
+                    if not name:
+                        name = f"Product {product_id}"
+                    
+                    seen_ids.add(product_id)
+                    
+                    # Build full URL
+                    if href.startswith('http'):
+                        url = href
+                    elif href.startswith('/'):
+                        url = f"https://shop.line.me{href}"
+                    else:
+                        url = f"https://shop.line.me/{shop_handle}/product/{product_id}"
+                    
+                    products.append({
+                        "id": product_id,
+                        "url": url,
+                        "name": name,
+                    })
+                
+                except Exception as e:
+                    log.debug("ข้าม product link: %s", e)
+                    continue
+        
+        finally:
+            await browser.close()
+    
+    return products
+
+
+def _extract_products_from_data(data: Any, shop_handle: str) -> list[dict]:
+    """ค้นหา product objects ใน JSON data และคืน list ของ products"""
+    products: list[dict] = []
+    seen_ids: set[int] = set()
+
+    def _search(obj, depth: int = 0):
+        if depth > 25:
+            return
+        if isinstance(obj, dict):
+            # ตรวจสอบว่าเป็น product object หรือไม่
+            if "id" in obj or "productId" in obj:
+                pid = obj.get("id") or obj.get("productId")
+                if isinstance(pid, int) and pid > 10000 and pid not in seen_ids:
+                    name = obj.get("name") or obj.get("productName") or obj.get("title") or ""
+                    if isinstance(name, str):
+                        seen_ids.add(pid)
+                        products.append({
+                            "id": pid,
+                            "url": f"https://shop.line.me/{shop_handle}/product/{pid}",
+                            "name": name.strip(),
+                        })
+            for v in obj.values():
+                _search(v, depth + 1)
+        elif isinstance(obj, list):
+            for item in obj:
+                _search(item, depth + 1)
+
+    _search(data)
+    return products
+
+
+def select_first_available_variant(variants: list[dict]) -> Optional[dict]:
+    """
+    เลือก variant แรกที่ available != 0
+    ถ้าไม่มี variant ที่มีสต็อก → คืน variant แรก (available == -1)
+    """
+    if not variants:
+        return None
+
+    # ลองหา variant ที่ available > 0 หรือ -1 (ไม่ทราบสต็อก)
+    for v in variants:
+        stock = v.get("available", -1)
+        if stock != 0:
+            return v
+
+    # ถ้าทุก variant หมด → คืน variant แรก
+    return variants[0]
+
+
+async def monitor_shop_for_new_products(
+    shop_url: str,
+    sale_start_time: str,
+    check_interval_ms: int,
+    session_file: str,
+    product_name_pattern: Optional[str] = None,
+) -> dict:
+    """
+    Monitor ร้านและคืน product ใหม่ที่โผล่ขึ้นมา
+    Returns: {"id": int, "url": str, "name": str}
+    """
+    log.info("📡 โหลด baseline products...")
+    baseline = await fetch_shop_products(shop_url, session_file)
+    baseline_ids = {p["id"] for p in baseline}
+    log.info("📡 Baseline products: %d รายการ", len(baseline_ids))
+    if baseline:
+        log.info("📦 สินค้าที่เจอ:")
+        for p in baseline:
+            log.info("   • [%d] %s", p["id"], p["name"])
+    else:
+        log.warning("⚠️  ไม่พบสินค้าใด (อาจเป็นเพราะร้านยังไม่เปิดขาย)")
+
+    # รอเวลา sale_start_time
+    target_time = parse_sale_time(sale_start_time)
+    now = datetime.now()
+    target_dt = datetime.combine(now.date(), target_time)
+
+    # ถ้าเวลาผ่านไปแล้ว → ใช้วันถัดไป
+    if target_dt < now:
+        from datetime import timedelta
+        target_dt += timedelta(days=1)
+
+    wait_seconds = (target_dt - datetime.now()).total_seconds()
+    if wait_seconds > 0:
+        log.info("⏰ รอจนถึงเวลาขาย %s (อีก %.1f วินาที)...", sale_start_time, wait_seconds)
+        await asyncio.sleep(wait_seconds)
+
+    interval_sec = check_interval_ms / 1000.0
+    pattern = re.compile(product_name_pattern) if product_name_pattern else None
+    poll_count = 0
+    
+    log.info("🔍 เริ่ม polling shop...")
+    log.info("   ⏱️  Interval: %.2f วินาที", interval_sec)
+    log.info("   🎯 Pattern: %s", product_name_pattern or "(ทุกสินค้า)")
+
+    while True:
+        try:
+            poll_count += 1
+            poll_time = datetime.now().strftime("%H:%M:%S.%f")[:-3]
+            log.info("🔄 Poll #%d [%s] กำลังตรวจสอบร้าน...", poll_count, poll_time)
+            
+            current = await fetch_shop_products(shop_url, session_file)
+            current_ids = {p["id"] for p in current}
+            new_ids = current_ids - baseline_ids
+            
+            log.info("   📊 สินค้าทั้งหมด: %d | ใหม่: %d", len(current_ids), len(new_ids))
+
+            if new_ids:
+                new_products = [p for p in current if p["id"] in new_ids]
+                print("\n" + "="*60)
+                print("🆕 ตรวจพบสินค้าใหม่ %d รายการ:" % len(new_products))
+                print("="*60)
+                for p in new_products:
+                    print(f"\033[92m   ✨ [{p['id']}] {p['name']}\033[0m")
+                print("="*60 + "\n")
+                log.info("🆕 ตรวจพบสินค้าใหม่ %d รายการ:", len(new_products))
+                for p in new_products:
+                    log.info("   • [%d] %s", p["id"], p["name"])
+
+                # filter ตาม pattern ถ้ามี
+                if pattern:
+                    filtered = [p for p in new_products if pattern.search(p["name"])]
+                    if filtered:
+                        selected = filtered[0]
+                        log.info("✓ เลือกสินค้าที่ตรง pattern: %s", selected["name"])
+                        print(f"\033[93m✓ เลือกสินค้าที่ตรง pattern: {selected['name']}\033[0m")
+                    else:
+                        log.warning("⚠️  สินค้าใหม่ไม่ตรงกับ pattern '%s' — เลือกตัวแรก", product_name_pattern)
+                        selected = new_products[0]
+                else:
+                    selected = new_products[0]
+                    log.info("✓ เลือกสินค้าแรก: %s", selected["name"])
+                    print(f"\033[93m✓ เลือกสินค้าแรก: {selected['name']}\033[0m")
+
+                print("\n" + "🚀 เริ่ม checkout flow")
+                print(f"   ID: {selected['id']}")
+                print(f"   Name: \033[96m{selected['name']}\033[0m")
+                print(f"   URL: {selected['url']}\n")
+                log.info("🚀 เริ่ม checkout flow")
+                log.info("   ID: %d", selected["id"])
+                log.info("   Name: %s", selected["name"])
+                log.info("   URL: %s", selected["url"])
+                return selected
+
+        except Exception as e:
+            log.warning("⚠️  Poll error: %s — ลองใหม่...", e)
+
+        await asyncio.sleep(interval_sec)
+
+
 # ==================== CHECKOUT HELPERS ====================
 
 async def close_popup(page: Page, context: str = "") -> bool:
@@ -1025,6 +1284,306 @@ async def select_promptpay(page: Page) -> bool:
 # ==================== MAIN FLOW ====================
 
 async def run(config: dict) -> None:
+    mode = config.get("mode", "").strip().lower()
+
+    # ==================== SHOP MONITOR MODE ====================
+    if mode == "shop_monitor":
+        shop_url = config.get("shop_url")
+        if not shop_url:
+            raise ValueError("mode=shop_monitor ต้องระบุ shop_url")
+
+        sale_start_time = config.get("sale_start_time", "00:00:00")
+        check_interval_ms = int(config.get("check_interval_ms", 500))
+        session_file = config.get("session_file", "line_session.json")
+        product_name_pattern = config.get("product_name_pattern")
+        auto_pick_first_variant = config.get("auto_pick_first_variant", True)
+        prewarm_browser = config.get("prewarm_browser", False)
+        quantity = int(config.get("quantity", 1))
+        headless = bool(config.get("headless", False))
+        auto_confirm = bool(config.get("auto_confirm", False))
+        encoding_mode = config.get("checkout_encoding", "auto")
+
+        log.info("🔵 โหมด: SHOP MONITOR")
+        log.info("🛍️  Shop: %s", shop_url)
+        log.info("⏰ Sale Time: %s", sale_start_time)
+        log.info("⚡ Check Interval: %d ms", check_interval_ms)
+
+        # Prewarm browser ถ้าเปิดใช้
+        prewarmed_browser: Optional[Browser] = None
+        prewarmed_context: Optional[BrowserContext] = None
+        prewarmed_page: Optional[Page] = None
+
+        if prewarm_browser:
+            log.info("🔥 Prewarming browser...")
+            pw = await async_playwright().start()
+            session_kwargs = {}
+            if Path(session_file).exists():
+                session_kwargs["storage_state"] = session_file
+
+            prewarmed_browser = await pw.chromium.launch(
+                headless=headless,
+                args=[
+                    "--disable-extensions",
+                    "--disable-default-apps",
+                    "--no-first-run",
+                    "--disable-sync",
+                    "--disable-translate",
+                    "--disable-blink-features=AutomationControlled",
+                ],
+            )
+            prewarmed_context = await prewarmed_browser.new_context(**session_kwargs)
+            await prewarmed_context.route(
+                "**/*",
+                lambda route: (
+                    route.abort()
+                    if route.request.resource_type in ["image", "font", "media", "stylesheet"]
+                    else route.continue_()
+                ),
+            )
+            prewarmed_page = await prewarmed_context.new_page()
+            prewarmed_page.set_default_timeout(5_000)
+            log.info("✅ Browser prewarmed")
+
+        # Monitor ร้านจนเจอสินค้าใหม่
+        new_product = await monitor_shop_for_new_products(
+            shop_url=shop_url,
+            sale_start_time=sale_start_time,
+            check_interval_ms=check_interval_ms,
+            session_file=session_file,
+            product_name_pattern=product_name_pattern,
+        )
+
+        product_url = new_product["url"]
+        product_id = new_product["id"]
+        shop_handle = parse_shop_handle(shop_url)
+
+        log.info("📦 Product: %s (ID: %d)", shop_handle, product_id)
+
+        # ดึง variants
+        variants: list[dict] = []
+        try:
+            variants = await fetch_variants_via_http(product_url, product_id, session_file)
+        except Exception as e:
+            log.warning("HTTP fetch variants ล้มเหลว: %s", e)
+
+        # เลือก variant
+        matched_variant: Optional[dict] = None
+        matched_label = "default"
+
+        if not variants:
+            log.info("📦 ไม่มี variant — checkout โดยตรง (productVariantId=null)")
+            matched_variant = {"id": None, "name": "default", "option1": None, "option2": None, "available": -1}
+        elif len(variants) == 1 or auto_pick_first_variant:
+            matched_variant = variants[0] if len(variants) == 1 else select_first_available_variant(variants)
+            if matched_variant:
+                matched_label = matched_variant["name"]
+                vid = matched_variant["id"]
+                log.info(
+                    "📦 เลือก variant แรก: %s (ID: %s)",
+                    matched_label, vid if vid is not None else "null",
+                )
+        else:
+            # มีหลาย variant แต่ไม่ auto_pick
+            log.error("❌ สินค้ามีหลาย variants แต่ไม่ได้เปิด auto_pick_first_variant")
+            if prewarmed_browser:
+                await prewarmed_browser.close()
+            return
+
+        if not matched_variant:
+            log.error("❌ ไม่สามารถเลือก variant ได้")
+            if prewarmed_browser:
+                await prewarmed_browser.close()
+            return
+
+        # สร้าง checkout URL
+        variant_id_for_url = matched_variant["id"]
+        checkout_url = build_checkout_url(
+            shop_handle=shop_handle,
+            product_id=product_id,
+            variant_id=variant_id_for_url,
+            quantity=quantity,
+            encoding_mode=encoding_mode,
+        )
+        log.info("🔗 Checkout URL: %s", checkout_url)
+
+        # ใช้ prewarmed browser หรือเปิดใหม่
+        if prewarmed_browser and prewarmed_page:
+            page = prewarmed_page
+            browser = prewarmed_browser
+            context = prewarmed_context
+            log.info("🌐 ใช้ prewarmed browser")
+        else:
+            log.info("🌐 เปิด browser...")
+            pw = await async_playwright().start()
+            session_kwargs = {}
+            if Path(session_file).exists():
+                session_kwargs["storage_state"] = session_file
+
+            browser = await pw.chromium.launch(
+                headless=headless,
+                args=[
+                    "--disable-extensions",
+                    "--disable-default-apps",
+                    "--no-first-run",
+                    "--disable-sync",
+                    "--disable-translate",
+                    "--disable-blink-features=AutomationControlled",
+                ],
+            )
+            context = await browser.new_context(**session_kwargs)
+            await context.route(
+                "**/*",
+                lambda route: (
+                    route.abort()
+                    if route.request.resource_type in ["image", "font", "media", "stylesheet"]
+                    else route.continue_()
+                ),
+            )
+            page = await context.new_page()
+            page.set_default_timeout(5_000)
+
+        await page.goto(checkout_url, wait_until="domcontentloaded", timeout=15_000)
+        log.info("✅ ถึงหน้า checkout — %s", page.url)
+
+        # เลือก PromptPay
+        paid = await select_promptpay(page)
+        if not paid:
+            log.error("❌ เลือก PromptPay ไม่สำเร็จ")
+            await browser.close()
+            return
+
+        log.info("💳 เลือก PromptPay แล้ว")
+
+        try:
+            await page.keyboard.press("Escape")
+        except Exception:
+            pass
+        await close_popup(page, "before-place-order")
+
+        # ดึงราคา
+        actual_price = ""
+        try:
+            html_content = await page.content()
+            all_prices = re.findall(r"฿\s*([0-9,]+(?:\.[0-9]{2})?)", html_content)
+            price_values: list[int] = []
+            for p in all_prices:
+                val_str = p.replace(",", "")
+                price_values.append(int(float(val_str)) if "." in val_str else int(val_str))
+            significant = sorted([p for p in set(price_values) if p >= 100], reverse=True)
+            if significant:
+                actual_price = str(significant[0])
+                log.info("✅ ราคา: ฿%s", actual_price)
+        except Exception as price_err:
+            log.warning("ดึงราคาจาก checkout ไม่ได้: %s", price_err)
+
+        # แสดงสรุป
+        print()
+        print("=" * 60)
+        print("📦 พร้อม Place Order (SHOP MONITOR MODE)")
+        print("=" * 60)
+        print(f"สินค้า : {new_product['name']}")
+        if actual_price:
+            print(f"ราคา   : ฿{actual_price}")
+        print(f"ตัวเลือก: {matched_label}")
+        print(f"จำนวน  : {quantity}")
+        print(f"ร้านค้า : {shop_handle}")
+        print(f"ชำระเงิน: PromptPay")
+        print("=" * 60)
+        print()
+
+        if not auto_confirm:
+            await asyncio.to_thread(
+                input, ">>> กด Enter เพื่อ Place Order หรือ Ctrl+C เพื่อยกเลิก: "
+            )
+
+        # Place Order
+        place_order_btn = page.locator(
+            'button:has-text("Place Order"), button:has-text("สั่งซื้อ"), '
+            '[role="button"]:has-text("Place Order"), [role="button"]:has-text("สั่งซื้อ")'
+        ).first
+
+        try:
+            url_before = page.url
+            await place_order_btn.click(timeout=5_000)
+            log.info("🛒 กด Place Order...")
+
+            try:
+                await page.wait_for_load_state("networkidle", timeout=10_000)
+            except Exception:
+                pass
+
+            url_after = page.url
+
+            if url_before == url_after:
+                ignore_texts = {"ดูทั้งหมด", "รวมทั้งหมด", "total", "view all", "see all"}
+                error_selectors = [
+                    "text=/error/i",
+                    "text=/ผิดพลาด/i",
+                    '[role="alert"]',
+                    '[class*="error"]',
+                    '[class*="Error"]',
+                ]
+                found_errors: list[str] = []
+                for sel in error_selectors:
+                    try:
+                        msgs = await page.locator(sel).all_text_contents()
+                        found_errors.extend(
+                            m.strip()
+                            for m in msgs
+                            if m.strip() and m.strip().lower() not in ignore_texts
+                        )
+                    except Exception:
+                        pass
+
+                if found_errors:
+                    log.error("❌ พบ error: %s", found_errors)
+                    print("\n" + "=" * 60)
+                    print("❌ ไม่สามารถ Place Order ได้")
+                    print("=" * 60)
+                    for err in found_errors:
+                        print(f"  • {err}")
+                    print("=" * 60 + "\n")
+                else:
+                    log.warning("⚠️  URL ไม่เปลี่ยน และไม่พบ error message")
+
+                try:
+                    await page.screenshot(path="debug_place_order_failed.png")
+                    log.info("บันทึก screenshot: debug_place_order_failed.png")
+                except Exception:
+                    pass
+
+            else:
+                log.info("✅ URL เปลี่ยน → %s", url_after)
+                if any(k in url_after for k in ("payment", "success", "order")):
+                    log.info("✅ ไปหน้า payment/success/order แล้ว")
+                else:
+                    log.warning("⚠️  URL ไม่ใช่หน้า payment/success: %s", url_after)
+
+                log.info("รอ QR code / payment page...")
+                try:
+                    await page.wait_for_load_state("networkidle", timeout=5_000)
+                except Exception:
+                    pass
+
+                try:
+                    await page.screenshot(path="debug_payment_page.png")
+                    log.info("บันทึก screenshot: debug_payment_page.png")
+                except Exception:
+                    pass
+
+        except Exception as place_err:
+            log.error("❌ กด Place Order ล้มเหลว: %s", place_err)
+            try:
+                await page.screenshot(path="debug_place_order_error.png")
+                log.info("บันทึก screenshot: debug_place_order_error.png")
+            except Exception:
+                pass
+
+        log.info("✅ เสร็จสิ้น — ปิด browser")
+        await browser.close()
+        return
+
+    # ==================== PRODUCT URL MODE (เดิม) ====================
     product_url: str = config["product_url"]
     quantity: int = int(config.get("quantity", 1))
 

@@ -1,15 +1,21 @@
-{"product_url": "https://shop.line.me/@sukiteenoi/product/1008137750",
+{
+    "product_url": "https://shop.line.me/@sukiteenoi/product/1008137750",
     "session_file": "line_session.json",
-
     "preferred_1": ["1 ซอง"],
     "preferred_2": ["S"],
-
     "quantity": 1,
     "checkout_encoding": "auto",
-
-    "headless": true,
+    "headless": false,
     "auto_confirm": false,
-
     "check_interval_seconds": 1,
-    "max_stock_checks": 120
+    "max_stock_checks": 120,
+
+    "mode": "shop_monitor",
+  "shop_url": "https://shop.line.me/@thelandofvava",
+  "sale_start_time": "00:11:30",
+  "check_interval_ms": 500,
+  "auto_pick_first_product": true,
+  "auto_pick_first_variant": true,
+  "prewarm_browser": true,
+  "product_name_pattern": ".*"
 }

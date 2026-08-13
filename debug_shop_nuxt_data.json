@@ -1,0 +1,560 @@
+[
+  [
+    "ShallowReactive",
+    1
+  ],
+  {
+    "data": 2,
+    "state": 120,
+    "once": 126,
+    "_errors": 127,
+    "serverRendered": 11,
+    "path": 129,
+    "pinia": 130
+  },
+  [
+    "ShallowReactive",
+    3
+  ],
+  {
+    "shop:@mergeth": 4,
+    "shop:@mergeth:active.campaign": 18,
+    "user:cart:quantity": 15,
+    "shop:@mergeth:collections": 31,
+    "shop-coupon-@mergeth": 104,
+    "06RyBMM8G11FwnA_2OxI1X2RgZ2KkeisO3k_IqLKG3U": 105,
+    "shop.and.product:@mergeth": 107,
+    "_apollo:promotionClient": 113,
+    "_apollo:customerClient": 116,
+    "_apollo:searchClient": 117,
+    "_apollo:searchClientWithAuth": 118,
+    "_apollo:mallClient": 119
+  },
+  {
+    "shopId": 5,
+    "shopName": 6,
+    "searchId": 7,
+    "imgUrl": 8,
+    "isShowGallery": 9,
+    "brandType": 10,
+    "hasRlp": 11,
+    "friendCount": 12,
+    "sellerStatus": 13,
+    "isTerminate": 9,
+    "vacation": 14,
+    "lineTagId": 15,
+    "hasLineAdsConversion": 9,
+    "hasGift": 9,
+    "hasMyPayment": 11,
+    "hasTrustBadge": 9,
+    "itemsSold": 16,
+    "hasMessenger": 9,
+    "randomId": 17,
+    "premiumId": 7,
+    "shippingBadge": 15,
+    "alias": 15,
+    "aliasDisplayOption": 15,
+    "description": 15,
+    "descriptionDisplayOption": 15
+  },
+  260045,
+  "Merge.official",
+  "@mergeth",
+  "https://profile.line-scdn.net/0hRqk5OtKNDV5WTBNe7ahyCWoJAzMhYgsWLi4RMHocVT1_fk4NPXoRPHdNAW9zeUgIaSkSb3VJAWsv",
+  false,
+  "VERIFIED",
+  true,
+  371970,
+  "NORMAL",
+  {
+    "status": 9,
+    "startedAt": 15,
+    "endedAt": 15
+  },
+  null,
+  1000,
+  "@cew1101t",
+  {
+    "campaign": 19,
+    "coupon": 15,
+    "extraCoupons": 30,
+    "affiliate": 15
+  },
+  {
+    "id": 20,
+    "maxPoint": 21,
+    "maxPointPerUser": 21,
+    "tcUrl": 22,
+    "pointType": 23,
+    "tiers": 24,
+    "isRemainingPoint": 9
+  },
+  1013,
+  50,
+  "https://shop.line.me/blog/articles/349/aug26-line-points-back",
+  "PERCENT",
+  [
+    25
+  ],
+  {
+    "point": 21,
+    "pointPercent": 26,
+    "type": 27,
+    "conditions": 28
+  },
+  0.02,
+  "MIN_PURCHASE",
+  {
+    "minPurchase": 29
+  },
+  1500,
+  [],
+  [
+    32,
+    36,
+    40,
+    44,
+    48,
+    52,
+    56,
+    60,
+    64,
+    68,
+    72,
+    76,
+    80,
+    84,
+    88,
+    92,
+    96,
+    100
+  ],
+  {
+    "id": 33,
+    "imgUrl": 34,
+    "collectionName": 35,
+    "isNew": 9
+  },
+  245665,
+  "https://obs-ect.line-scdn.net/r/ect/ect/cj0tNG02bGRja3Y5c2c2MyZzPWpwNiZ0PW0mdT0xbGVlZGp1djA0bzAyJmk9MA",
+  "IN TRANSIT (New)",
+  {
+    "id": 37,
+    "imgUrl": 38,
+    "collectionName": 39,
+    "isNew": 9
+  },
+  244532,
+  "https://obs-ect.line-scdn.net/r/ect/ect/cj0tNGVqb2ptNmZyOHI4cCZzPWpwNiZ0PW0mdT0xbDM1bzJtOGs0NjAwJmk9MA",
+  "Sweet Reverie",
+  {
+    "id": 41,
+    "imgUrl": 42,
+    "collectionName": 43,
+    "isNew": 9
+  },
+  243666,
+  "https://obs-ect.line-scdn.net/r/ect/ect/cj0ydDlqMWdldWZqNWJzJnM9anA2JnQ9bSZ1PTFrc2VtbWdiczRvMDAmaT0w",
+  "Lumière",
+  {
+    "id": 45,
+    "imgUrl": 46,
+    "collectionName": 47,
+    "isNew": 9
+  },
+  243667,
+  "https://obs-ect.line-scdn.net/r/ect/ect/cj0tNzJtN2M2bmdydmszbiZzPWpwNiZ0PW0mdT0xa3NkaTU1YjQzcGcwJmk9MA",
+  "MERGExGOHAN",
+  {
+    "id": 49,
+    "imgUrl": 50,
+    "collectionName": 51,
+    "isNew": 9
+  },
+  242202,
+  "https://obs-ect.line-scdn.net/r/ect/ect/cj0tNTY3amhsa2VncGQ4OSZzPWpwNiZ0PW0mdT0xa2JsZGRkYWc1NmcwJmk9MA",
+  "Thai Bold",
+  {
+    "id": 53,
+    "imgUrl": 54,
+    "collectionName": 55,
+    "isNew": 9
+  },
+  241355,
+  "https://obs-ect.line-scdn.net/r/ect/ect/cj0tMzJkMGkwMGxhamFmJnM9anA2JnQ9bSZ1PTFrNGs3YTNiczQxZzAmaT0w",
+  "Unbound The Rhythm",
+  {
+    "id": 57,
+    "imgUrl": 58,
+    "collectionName": 59,
+    "isNew": 9
+  },
+  240827,
+  "https://obs-ect.line-scdn.net/r/ect/ect/cj01bzFjMTQ5ZGNmaDAwJnM9anA2JnQ9bSZ1PTFqdmU0Ym8yczU4MDAmaT0w",
+  "Stellar Souls",
+  {
+    "id": 61,
+    "imgUrl": 62,
+    "collectionName": 63,
+    "isNew": 9
+  },
+  242376,
+  "https://obs-ect.line-scdn.net/r/ect/ect/cj01cnJsNmF1N3A4ZjdmJnM9anA2JnQ9bSZ1PTFrZGt2NmprODQ4ZzAmaT0w",
+  "MERGE BAG",
+  {
+    "id": 65,
+    "imgUrl": 66,
+    "collectionName": 67,
+    "isNew": 9
+  },
+  184609,
+  "https://obs-ect.line-scdn.net/r/ect/ect/cj1wZG1za2k3YXNhZHYmcz1qcDYmdD1tJnU9MWc0N3Y5anBjM2NnMCZpPTA",
+  "ACCESSORIES",
+  {
+    "id": 69,
+    "imgUrl": 70,
+    "collectionName": 71,
+    "isNew": 9
+  },
+  184384,
+  "https://obs-ect.line-scdn.net/r/ect/ect/image_16982190388272581046c6b2844t1274eb0e",
+  "TOPS",
+  {
+    "id": 73,
+    "imgUrl": 74,
+    "collectionName": 75,
+    "isNew": 9
+  },
+  184387,
+  "https://obs-ect.line-scdn.net/r/ect/ect/image_1698219101028384270b5786416t1274eb4d",
+  "T-SHIRT",
+  {
+    "id": 77,
+    "imgUrl": 78,
+    "collectionName": 79,
+    "isNew": 9
+  },
+  184391,
+  "https://obs-ect.line-scdn.net/r/ect/ect/image_1698219173179252623b5786632t1274eb95",
+  "SHIRTS",
+  {
+    "id": 81,
+    "imgUrl": 82,
+    "collectionName": 83,
+    "isNew": 9
+  },
+  184607,
+  "https://obs-ect.line-scdn.net/r/ect/ect/image_1698382686569413973b5784512t12776a4e",
+  "JACKETS",
+  {
+    "id": 85,
+    "imgUrl": 86,
+    "collectionName": 87,
+    "isNew": 9
+  },
+  184386,
+  "https://obs-ect.line-scdn.net/r/ect/ect/image_16982190826202500186c6a405t1274eb3a",
+  "SHORTS",
+  {
+    "id": 89,
+    "imgUrl": 90,
+    "collectionName": 91,
+    "isNew": 9
+  },
+  184388,
+  "https://obs-ect.line-scdn.net/r/ect/ect/image_1698219116456393036b5786450t1274eb5c",
+  "SKIRTS",
+  {
+    "id": 93,
+    "imgUrl": 94,
+    "collectionName": 95,
+    "isNew": 9
+  },
+  184383,
+  "https://obs-ect.line-scdn.net/r/ect/ect/image_1698219065886581818b5786310t1274eb29",
+  "JEANS",
+  {
+    "id": 97,
+    "imgUrl": 98,
+    "collectionName": 99,
+    "isNew": 9
+  },
+  184389,
+  "https://obs-ect.line-scdn.net/r/ect/ect/image_16982191321862908146c6a525t1274eb6c",
+  "TROUSERS",
+  {
+    "id": 101,
+    "imgUrl": 102,
+    "collectionName": 103,
+    "isNew": 9
+  },
+  184390,
+  "https://obs-ect.line-scdn.net/r/ect/ect/image_1698219146502391375b5786568t1274eb7a",
+  "DRESSES",
+  [],
+  {
+    "promotions": 106
+  },
+  [],
+  {
+    "shopId": 5,
+    "shopName": 6,
+    "imgUrl": 8,
+    "shopFriends": 12,
+    "defaultTab": 108,
+    "productDisplay": 109,
+    "sortSoldOut": 110,
+    "searchId": 7,
+    "isShowGallery": 9,
+    "brandType": 10,
+    "hasRlp": 11,
+    "hasProduct": 11,
+    "items": 111,
+    "totalRow": 112
+  },
+  "PRODUCT",
+  "POPULAR",
+  "NONE",
+  [],
+  1,
+  {
+    "ROOT_QUERY": 114
+  },
+  [
+    "null",
+    "__typename",
+    115,
+    "promotions({\"limit\":1,\"searchId\":\"@mergeth\"})",
+    106
+  ],
+  "Query",
+  {},
+  {},
+  {},
+  {},
+  [
+    "Reactive",
+    121
+  ],
+  {
+    "$snuxt-i18n-meta": 122,
+    "$svue-query": 123
+  },
+  {},
+  {
+    "mutations": 124,
+    "queries": 125
+  },
+  [],
+  [],
+  [
+    "Set"
+  ],
+  [
+    "ShallowReactive",
+    128
+  ],
+  {
+    "shop:@mergeth": 15,
+    "shop:@mergeth:active.campaign": 15,
+    "user:cart:quantity": 15,
+    "banners": 15,
+    "shop:@mergeth:collections": 15,
+    "shop-coupon-@mergeth": 15,
+    "06RyBMM8G11FwnA_2OxI1X2RgZ2KkeisO3k_IqLKG3U": 15,
+    "shop:@mergeth:spd-promotions": 15,
+    "shop.and.product:@mergeth": 15
+  },
+  "/@mergeth",
+  [
+    "Reactive",
+    131
+  ],
+  {
+    "customer": 132,
+    "introductionStore": 143,
+    "allowPersonalStore": 162,
+    "shopInfoShore": 163,
+    "campaignStore": 171,
+    "cartStore": 176,
+    "gift_app_header": 177
+  },
+  {
+    "customerId": 133,
+    "liffProfile": 135,
+    "locale": 138,
+    "versionAcceptConsent": 140,
+    "isDisplayModalLogin": 141
+  },
+  [
+    "EmptyRef",
+    134
+  ],
+  "_",
+  [
+    "Ref",
+    136
+  ],
+  [
+    "Reactive",
+    137
+  ],
+  {},
+  [
+    "Ref",
+    139
+  ],
+  "en",
+  [
+    "EmptyRef",
+    134
+  ],
+  [
+    "EmptyRef",
+    142
+  ],
+  "false",
+  {
+    "introductions": 144
+  },
+  [
+    145,
+    148,
+    150,
+    160
+  ],
+  {
+    "name": 146,
+    "type": 147,
+    "isReadyToShow": 9,
+    "isShowing": 9,
+    "isDone": 9
+  },
+  "concent",
+  "bottomSheet",
+  {
+    "name": 149,
+    "type": 147,
+    "isReadyToShow": 9,
+    "isShowing": 9,
+    "isDone": 9
+  },
+  "share",
+  {
+    "name": 151,
+    "isAllDone": 9,
+    "isSomeShow": 9,
+    "sequence": 152
+  },
+  "priorityGroup",
+  [
+    153,
+    155,
+    157
+  ],
+  {
+    "name": 154,
+    "type": 147,
+    "isReadyToShow": 9,
+    "isShowing": 9,
+    "isDone": 9
+  },
+  "gift",
+  {
+    "name": 156,
+    "type": 147,
+    "isReadyToShow": 9,
+    "isShowing": 9,
+    "isDone": 9
+  },
+  "LMExtra",
+  {
+    "name": 158,
+    "type": 159,
+    "isReadyToShow": 9,
+    "isShowing": 9,
+    "isDone": 9
+  },
+  "affiliated",
+  "modal",
+  {
+    "name": 161,
+    "type": 159,
+    "isReadyToShow": 9,
+    "isShowing": 9,
+    "isDone": 9
+  },
+  "campaign",
+  {
+    "isModalPersonalizedContentAccepted": 9
+  },
+  {
+    "shop": 164,
+    "shopState": 169
+  },
+  {
+    "id": 165,
+    "shopName": 166,
+    "shopId": 165,
+    "imgUrl": 166,
+    "defaultTab": 108,
+    "productDisplay": 166,
+    "searchId": 166,
+    "premiumId": 166,
+    "randomId": 166,
+    "isShowGallery": 9,
+    "brandType": 166,
+    "hasRlp": 9,
+    "conversion": 167,
+    "vacation": 168,
+    "sellerStatus": 13,
+    "isTerminate": 9,
+    "isVacation": 9,
+    "friendCount": 165,
+    "sortSoldOut": 110,
+    "lineTagId": 166,
+    "hasGift": 9,
+    "hasMyPayment": 9,
+    "hasTrustBadge": 9,
+    "hasLineAdsConversion": 9,
+    "hasMessenger": 9,
+    "itemsSold": 165
+  },
+  0,
+  "",
+  {
+    "conversionId": 166,
+    "purchaseConversionLabel": 166,
+    "addtocartConversionLabel": 166
+  },
+  {
+    "status": 9,
+    "startedAt": 166,
+    "endedAt": 166
+  },
+  {
+    "products": 170,
+    "isFilterGift": 9
+  },
+  [],
+  {
+    "campaignActive": 172,
+    "campaignAffiliated": 173,
+    "campaignCoupon": 174,
+    "campaignExtraCoupons": 175
+  },
+  {},
+  {},
+  {},
+  [],
+  {
+    "quantity": 165
+  },
+  {
+    "isShowGiftAppHeader": 178
+  },
+  [
+    "EmptyRef",
+    142
+  ]
+]
