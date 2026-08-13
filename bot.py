@@ -489,189 +489,278 @@ async def proceed_to_checkout(page: Page, sizes: list[str], debug_screenshots: b
 
 async def select_promptpay(page: Page, debug_screenshots: bool = False) -> bool:
     """
-    ทำงานบน /checkout/cart (cart review):
-      1. ปิด campaign modal
-      2. เลือก PromptPay card (ที่หน้า cart)
-      3. กด Place Order
-      4. หยุดรอ — ให้ user ยืนยันการชำระเงิน
+    Fast path: ใช้ JS inject เพื่อเลือก PromptPay และเตรียม Place Order
+    - ไม่รอ visual render / popup / scroll
+    - JS รันใน browser โดยตรง ไม่สนว่า element visible หรือถูกบัง
     """
     try:
-        log.info("รอหน้า checkout โหลด...")
+        log.info("รอหน้า checkout โหลด (domcontentloaded)...")
         await page.wait_for_load_state("domcontentloaded", timeout=15_000)
 
-        # รอให้ปุ่ม Place Order ปรากฏก่อน — นี่คือสัญญาณว่าหน้าพร้อมจริงๆ
-        # ไม่ใช้ timeout ตายตัว เพราะเน็ตช้าบ้างเร็วบ้าง
-        log.info("รอให้ Place Order button ปรากฏ (รอสูงสุด 20s)...")
+        # ======== Step A: ถ้ายังอยู่หน้า cart — กด Checkout ผ่านไปหน้า payment ========
+        current_url = page.url
+        if "/checkout/cart" in current_url:
+            log.info("อยู่หน้า cart — ปิด popup แล้วรอ Vue render...")
+
+            # ปิด popup ก่อน (สำคัญ: ต้องทำก่อนรอปุ่ม ไม่งั้น Vue ไม่ hydrate)
+            try:
+                await page.keyboard.press("Escape")
+                await page.wait_for_timeout(300)
+            except:
+                pass
+            await close_popup(page, "cart-checkout")
+            await page.wait_for_timeout(200)
+
+            # รอ networkidle ให้ Vue render เสร็จ (สูงสุด 10s)
+            try:
+                await page.wait_for_load_state("networkidle", timeout=10_000)
+                log.info("✓ networkidle แล้ว")
+            except PWTimeout:
+                log.warning("⚠️  networkidle timeout — ดำเนินการต่อ")
+
+            # รอปุ่ม Place Order ขึ้นบน cart page (Vue render) สูงสุด 15s
+            try:
+                await page.wait_for_selector(
+                    'button:has-text("Place Order"), button:has-text("Checkout"), button:has-text("ชำระเงิน")',
+                    state="attached", timeout=15_000
+                )
+                log.info("✓ ปุ่ม Place Order/Checkout ปรากฏบน cart page")
+            except PWTimeout:
+                log.warning("⚠️  รอ cart buttons timeout — ลองต่อ")
+
+            await save_screenshot(page, "debug_cart_page.png", debug_screenshots)
+
+            # Dump ปุ่มทั้งหมดบน cart page
+            cart_btns = await page.evaluate("""
+                () => {
+                    const btns = [];
+                    document.querySelectorAll('button, [role="button"], a[href*="checkout"]').forEach((b, i) => {
+                        const txt = b.innerText?.trim() || b.textContent?.trim() || '';
+                        if (txt) btns.push({ index: i, text: txt.slice(0,60), disabled: b.disabled, tag: b.tagName });
+                    });
+                    return btns;
+                }
+            """)
+            log.info("=== ปุ่มบน cart page (%d ปุ่ม) ===", len(cart_btns))
+            for b in cart_btns:
+                log.info("  [%d] <%s> '%s' disabled=%s", b["index"], b["tag"], b["text"].replace("\n"," "), b["disabled"])
+            log.info("=================================")
+
+            # กด Checkout / Place Order / Next
+            checkout_btn_selectors = [
+                'button:has-text("Checkout")',
+                'button:has-text("ชำระเงิน")',
+                'button:has-text("Place Order")',
+                'button:has-text("สั่งซื้อ")',
+                'button:has-text("Next")',
+                'button:has-text("ถัดไป")',
+                'button:has-text("Proceed")',
+                'button:has-text("Confirm")',
+            ]
+            cart_clicked = False
+            for sel in checkout_btn_selectors:
+                try:
+                    btn = page.locator(sel).first
+                    if await btn.count() > 0:
+                        is_dis = await btn.is_disabled()
+                        log.info("พบ '%s' disabled=%s — %s", sel, is_dis, "ข้าม" if is_dis else "กด!")
+                        if not is_dis:
+                            await btn.click(timeout=3_000)
+                            log.info("✓ กด Checkout สำเร็จ")
+                            cart_clicked = True
+                            break
+                except Exception as e:
+                    log.debug("  %s ล้มเหลว: %s", sel, e)
+                    continue
+
+            if cart_clicked:
+                log.info("รอออกจาก cart page...")
+                try:
+                    await page.wait_for_url(lambda url: "/checkout/cart" not in url, timeout=15_000)
+                    log.info("✓ ออกจาก cart แล้ว: %s", page.url)
+                except PWTimeout:
+                    log.warning("⚠️  ยังอยู่หน้า cart: %s", page.url)
+            else:
+                log.warning("⚠️  ไม่พบปุ่ม Checkout — URL ปัจจุบัน: %s", page.url)
+
+        # รอ Vue/React render payment section
+        log.info("รอ payment section โหลด (สูงสุด 20s)...")
         try:
             await page.wait_for_selector(
-                'button:has-text("Place Order"), button:has-text("สั่งซื้อ"), '
-                '[role="button"]:has-text("Place Order"), [role="button"]:has-text("สั่งซื้อ")',
-                timeout=20_000,
-                state="attached"  # attached = อยู่ใน DOM แม้ popup บัง
+                'input[type="radio"], button:has-text("Place Order"), button:has-text("สั่งซื้อ")',
+                state="attached",
+                timeout=20_000
             )
-            log.info("✓ Place Order button ปรากฏแล้ว — หน้า checkout พร้อม")
+            log.info("✓ payment section อยู่ใน DOM แล้ว")
         except PWTimeout:
-            log.warning("⚠️  Place Order button ไม่ปรากฏใน 20s — ดำเนินการต่อ")
+            log.warning("⚠️  payment section ไม่ปรากฏใน 20s — ดำเนินการต่อ")
 
-        log.info("URL ปัจจุบัน: %s", page.url)
-        await save_screenshot(page, "debug_checkout.png", debug_screenshots)
-
-        # ปิด popup วนซ้ำจนหมด (popup อาจมีหลายชั้น)
-        log.info("ตรวจสอบและปิด popup ที่หน้า checkout...")
-        for _ in range(5):
-            closed = await close_popup(page, "checkout")
-            if not closed:
-                break
-            await page.wait_for_timeout(600)
-            # ตรวจสอบว่ายังอยู่หน้า checkout หรือไม่
-            if "/checkout/cart" not in page.url:
-                log.warning(f"⚠️  ปิด popup แล้วออกจากหน้า checkout: {page.url}")
-                return False
-
-        await save_screenshot(page, "debug_after_close_popup.png", debug_screenshots)
-
-        # ตรวจสอบว่ายังอยู่หน้า checkout/cart หรือไม่
-        current_url = page.url
-        if "/checkout/cart" not in current_url:
-            log.warning(f"⚠️  หลังปิด popup กลับไปหน้าอื่น: {current_url}")
-            return False
-
-        log.info(f"✓ ยังอยู่หน้า checkout/cart: {current_url}")
-
-        # ======== เลือก PromptPay ก่อน (ที่หน้า cart) ========
-        log.info("กำลังหา PromptPay option ที่หน้า cart...")
-
-        # Scroll ลงมาที่ส่วน Payment ก่อน
+        # กด Escape ปิด popup ง่ายๆ ก่อน (ถ้ามี)
         try:
-            payment_section = page.locator("text=Payment").first
-            if await payment_section.is_visible(timeout=1000):
-                await payment_section.scroll_into_view_if_needed()
-                await page.wait_for_timeout(200)
-                log.info("Scroll ลงมาที่ส่วน Payment แล้ว")
+            await page.keyboard.press("Escape")
+            await page.wait_for_timeout(150)
         except:
             pass
 
-        await save_screenshot(page, "debug_before_promptpay.png", debug_screenshots)
+        await save_screenshot(page, "debug_checkout.png", debug_screenshots)
 
-        # ====== เลือก PromptPay — retry สูงสุด 3 รอบถ้าไม่พบ ======
-        # เริ่มจาก text node "PromptPay" แบบ exact → walk up หา radio ของ option นั้นโดยตรง
-        # หลีกเลี่ยง:
-        #   - data-testid='payment-option-0'  → อาจเป็น LINE Pay (default option แรก)
-        #   - div:has-text('PromptPay')       → จับ wrapper div ทั้งส่วน, radio แรกใน div คือ LINE Pay
-        selected = False
-        for pp_attempt in range(3):
-            if pp_attempt > 0:
-                log.info(f"ไม่พบ PromptPay — ลองปิด popup แล้วหาใหม่ (รอบ {pp_attempt + 1}/3)...")
-                # มีปัญหา: ลองปิด popup ที่อาจขวางอยู่ก่อน
-                await close_popup(page, f"checkout-retry-{pp_attempt}")
-                await page.wait_for_timeout(800)
+        # ======== DEBUG: dump DOM payment section ========
+        dom_info = await page.evaluate("""
+            () => {
+                const result = { radios: [], texts: [], allInputs: [] };
 
-            # วิธีหลัก: get_by_text exact
-            try:
-                pp_text = page.get_by_text("PromptPay", exact=True).first
-                if await pp_text.is_visible(timeout=2000):
-                    log.info(f"พบ text 'PromptPay' (exact) รอบที่ {pp_attempt + 1} — walk up หา radio")
-                    await pp_text.scroll_into_view_if_needed()
-                    await page.wait_for_timeout(300)
+                // dump radio inputs ทั้งหมด
+                document.querySelectorAll('input[type="radio"]').forEach((r, i) => {
+                    result.radios.push({
+                        index: i,
+                        name: r.name,
+                        value: r.value,
+                        checked: r.checked,
+                        id: r.id,
+                        parentText: r.parentElement ? r.parentElement.innerText?.slice(0,80) : '',
+                        grandparentText: r.parentElement?.parentElement
+                            ? r.parentElement.parentElement.innerText?.slice(0,80) : ''
+                    });
+                });
 
-                    # walk up ancestor ทีละชั้น จนพบ radio button ของ option นี้
-                    radio_to_click = None
-                    for depth in range(1, 7):
-                        xpath = "/".join([".."] * depth)
-                        try:
-                            candidate = pp_text.locator(f"xpath={xpath}//input[@type='radio']").first
-                            if await candidate.count() > 0:
-                                log.info(f"  พบ radio ที่ ancestor depth={depth}")
-                                radio_to_click = candidate
-                                break
-                        except:
-                            pass
+                // dump text nodes ที่มี "promptpay" หรือ "payment"
+                const walker = document.createTreeWalker(document.body, NodeFilter.SHOW_TEXT, null);
+                while (walker.nextNode()) {
+                    const t = walker.currentNode.textContent.trim();
+                    if (t && (t.toLowerCase().includes('promptpay') || t.toLowerCase().includes('payment'))) {
+                        result.texts.push({
+                            text: t.slice(0, 100),
+                            parentTag: walker.currentNode.parentElement?.tagName,
+                            parentClass: walker.currentNode.parentElement?.className?.slice(0,60)
+                        });
+                    }
+                }
 
-                    if radio_to_click is not None:
-                        await radio_to_click.click(timeout=2000, force=True)
-                        await page.wait_for_timeout(500)
-                        try:
-                            if await radio_to_click.is_checked(timeout=1000):
-                                log.info("✓ เลือก PromptPay เรียบร้อย")
-                                selected = True
-                        except:
-                            pass
-                    else:
-                        # fallback: คลิกที่ตัวข้อความโดยตรง (กรณี custom UI ไม่ใช้ radio)
-                        log.info("  ไม่เจอ radio — คลิกที่ text element")
-                        await pp_text.click(timeout=2000, force=True)
-                        await page.wait_for_timeout(500)
-                        selected = True  # ถือว่าคลิกไปแล้ว
+                // dump input ทุกชนิด
+                document.querySelectorAll('input').forEach((inp, i) => {
+                    result.allInputs.push({ index: i, type: inp.type, name: inp.name, value: inp.value, id: inp.id });
+                });
 
-            except Exception as e:
-                log.warning(f"  get_by_text PromptPay รอบที่ {pp_attempt + 1} ล้มเหลว: {e}")
+                return result;
+            }
+        """)
+        log.info("=== DEBUG DOM DUMP ===")
+        log.info("Radio inputs (%d total):", len(dom_info.get("radios", [])))
+        for r in dom_info.get("radios", []):
+            log.info("  [%d] name=%s value=%s checked=%s | parent: %s",
+                     r["index"], r["name"], r["value"], r["checked"],
+                     r["parentText"].replace("\n", " "))
+        log.info("Text nodes with 'promptpay'/'payment' (%d total):", len(dom_info.get("texts", [])))
+        for t in dom_info.get("texts", []):
+            log.info("  '%s' in <%s class='%s'>", t["text"], t["parentTag"], t["parentClass"])
+        log.info("All inputs (%d total):", len(dom_info.get("allInputs", [])))
+        for inp in dom_info.get("allInputs", []):
+            log.info("  [%d] type=%s name=%s value=%s id=%s",
+                     inp["index"], inp["type"], inp["name"], inp["value"], inp["id"])
+        log.info("=== END DEBUG DOM DUMP ===")
 
-            # fallback ใน iteration เดียวกัน: ลอง label selector
-            if not selected:
-                try:
-                    lbl = page.locator("label:has-text('PromptPay')").first
-                    if await lbl.is_visible(timeout=1000):
-                        await lbl.scroll_into_view_if_needed()
-                        await page.wait_for_timeout(200)
-                        radio = lbl.locator("input[type='radio']").first
-                        if await radio.count() > 0:
-                            await radio.click(timeout=2000, force=True)
-                        else:
-                            await lbl.click(timeout=2000, force=True)
-                        await page.wait_for_timeout(500)
-                        log.info(f"คลิก PromptPay label แล้ว (fallback รอบที่ {pp_attempt + 1})")
-                        selected = True
-                except Exception as e:
-                    log.warning(f"  label fallback รอบที่ {pp_attempt + 1} ล้มเหลว: {e}")
+        # ======== JS inject: เลือก PromptPay (Vue custom component) ========
+        # LINE Shopping ไม่ใช้ <input type="radio"> — ใช้ Vue custom UI
+        # ต้องคลิก container ที่ wrap <P>PromptPay</P> แทน
+        log.info("JS inject: เลือก PromptPay (Vue custom)...")
+        pp_selected = await page.evaluate("""
+            () => {
+                // หา <P> ที่มีข้อความ "PromptPay" แล้วคลิก ancestor ที่ clickable
+                const walker = document.createTreeWalker(document.body, NodeFilter.SHOW_TEXT, null);
+                while (walker.nextNode()) {
+                    const txt = walker.currentNode.textContent.trim();
+                    if (txt === 'PromptPay' || txt.toLowerCase() === 'promptpay') {
+                        let el = walker.currentNode.parentElement; // <P>
+                        // walk up สูงสุด 8 ชั้น หา element ที่ clickable (มี onclick, role, cursor-pointer)
+                        for (let i = 0; i < 8; i++) {
+                            if (!el) break;
+                            const style = window.getComputedStyle(el);
+                            const hasClick = el.onclick
+                                || el.getAttribute('role') === 'button'
+                                || el.getAttribute('tabindex') != null
+                                || style.cursor === 'pointer';
+                            if (hasClick) {
+                                el.click();
+                                return { clicked: true, tag: el.tagName, cls: el.className?.slice(0,60) };
+                            }
+                            el = el.parentElement;
+                        }
+                        // ถ้าหา clickable ไม่เจอ ให้คลิก parent ตรงๆ (ชั้นที่ 3 จาก <P>)
+                        let fallback = walker.currentNode.parentElement; // <P>
+                        for (let j = 0; j < 3 && fallback?.parentElement; j++) fallback = fallback.parentElement;
+                        if (fallback) {
+                            fallback.click();
+                            return { clicked: true, tag: fallback.tagName, cls: fallback.className?.slice(0,60), fallback: true };
+                        }
+                    }
+                }
+                return { clicked: false };
+            }
+        """)
 
-            if selected:
-                break
+        if pp_selected and pp_selected.get("clicked"):
+            log.info("✓ คลิก PromptPay container: <%s class='%s'>%s",
+                     pp_selected.get("tag"), pp_selected.get("cls"),
+                     " (fallback)" if pp_selected.get("fallback") else "")
+            await page.wait_for_timeout(500)  # รอ Vue update state
+        else:
+            log.warning("⚠️  ไม่พบ PromptPay — ลองปิด popup แล้ว retry...")
+            await close_popup(page, "checkout-fast")
+            await page.wait_for_timeout(400)
+            pp_retry = await page.evaluate("""
+                () => {
+                    const walker = document.createTreeWalker(document.body, NodeFilter.SHOW_TEXT, null);
+                    while (walker.nextNode()) {
+                        const txt = walker.currentNode.textContent.trim();
+                        if (txt === 'PromptPay' || txt.toLowerCase() === 'promptpay') {
+                            let el = walker.currentNode.parentElement;
+                            for (let i = 0; i < 8; i++) {
+                                if (!el) break;
+                                const style = window.getComputedStyle(el);
+                                if (el.onclick || el.getAttribute('role')==='button'
+                                    || el.getAttribute('tabindex')!=null || style.cursor==='pointer') {
+                                    el.click();
+                                    return true;
+                                }
+                                el = el.parentElement;
+                            }
+                            // fallback: คลิก grandparent
+                            let fb = walker.currentNode.parentElement?.parentElement?.parentElement;
+                            if (fb) { fb.click(); return true; }
+                        }
+                    }
+                    return false;
+                }
+            """)
+            if pp_retry:
+                log.info("✓ เลือก PromptPay สำเร็จ (หลังปิด popup)")
+                await page.wait_for_timeout(500)
+            else:
+                log.warning("⚠️  ไม่พบ PromptPay — ดำเนินการต่อโดยไม่เลือก")
 
-        if not selected:
-            log.warning("⚠️  ไม่พบ PromptPay option หลังลอง 3 รอบ — ดำเนินการต่อโดยไม่เลือก")
+        # รอ state update หลังคลิก radio (สั้นมาก)
+        await page.wait_for_timeout(300)
 
         await save_screenshot(page, "debug_after_select_promptpay.png", debug_screenshots)
 
-        # ======== แล้วค่อยกด Place Order ========
-        log.info("กำลังหาปุ่ม Place Order...")
+        # ======== หา Place Order button แล้ว scroll ให้เห็น ========
+        place_order_btn = page.locator(
+            'button:has-text("Place Order"), button:has-text("สั่งซื้อ"), '
+            '[role="button"]:has-text("Place Order"), [role="button"]:has-text("สั่งซื้อ")'
+        ).first
 
-        place_order_selectors = [
-            'button:has-text("Place Order")',
-            'button:has-text("สั่งซื้อ")',
-            'button:has-text("ดำเนินการต่อ")',
-            'button:has-text("Proceed")',
-            '[role="button"]:has-text("Place Order")',
-            '[role="button"]:has-text("สั่งซื้อ")',
-        ]
-
-        place_order_btn = None
-        for selector in place_order_selectors:
-            try:
-                btn = page.locator(selector).first
-                if await btn.count() > 0 and await btn.is_visible(timeout=1000):
-                    place_order_btn = btn
-                    log.info(f"พบปุ่ม Place Order ด้วย selector: {selector}")
-                    break
-            except:
-                continue
-
-        if not place_order_btn:
+        if await place_order_btn.count() == 0:
             log.error("✗ ไม่พบปุ่ม Place Order")
             await save_screenshot(page, "debug_no_place_order.png", debug_screenshots)
             return False
 
-        # Scroll ให้เห็นปุ่มก่อน log ว่าพร้อม
         try:
             await place_order_btn.scroll_into_view_if_needed()
-            await page.wait_for_timeout(200)
+            await page.wait_for_timeout(150)
         except:
             pass
 
-        log.info("=" * 60)
-        log.info("✓ ถึงหน้า Place Order พร้อม PromptPay แล้ว")
-        log.info("✓ โปรแกรมจะหยุดที่นี่ — กรุณากด Place Order ในหน้าต่างเบราว์เซอร์")
-        log.info("=" * 60)
-
+        log.info("✓ PromptPay เลือกแล้ว — พร้อม Place Order")
         return True
 
     except PWTimeout as e:
@@ -767,13 +856,33 @@ async def monitor_and_buy(playwright, product_url: str, preferred_sizes: list[st
                 paid = await select_promptpay(page, debug_screenshots)
                 if paid:
                     log.info("=" * 60)
+                    log.info("✓ ถึงหน้า Place Order พร้อม PromptPay แล้ว")
                     if is_test:
-                        log.info("✓ [TEST MODE] ถึงหน้า Place Order พร้อม PromptPay แล้ว")
-                        log.info("✓ กรุณากด Place Order ในหน้าต่างเบราว์เซอร์ด้วยตนเอง")
+                        log.info("✓ [TEST MODE] กด Enter เพื่อยืนยัน Place Order หรือ Ctrl+C เพื่อยกเลิก")
                     else:
-                        log.info("✓ ถึงหน้า Place Order พร้อม PromptPay แล้ว")
-                        log.info("✓ โปรแกรมจะหยุดที่นี่ — กรุณากด Place Order ในหน้าต่างเบราว์เซอร์")
+                        log.info("✓ กด Enter ใน console นี้เพื่อกด Place Order อัตโนมัติ")
                     log.info("=" * 60)
+                    input(">>> กด Enter เพื่อ Place Order หรือ Ctrl+C เพื่อยกเลิก: ")
+                    # ปิด popup ที่อาจบัง Place Order ก่อนกด
+                    try:
+                        await page.keyboard.press("Escape")
+                        await page.wait_for_timeout(300)
+                    except:
+                        pass
+                    await close_popup(page, "before-place-order")
+                    await page.wait_for_timeout(300)
+                    # กด Place Order อัตโนมัติ
+                    try:
+                        place_order_btn = page.locator(
+                            'button:has-text("Place Order"), button:has-text("สั่งซื้อ"), '
+                            '[role="button"]:has-text("Place Order"), [role="button"]:has-text("สั่งซื้อ")'
+                        ).first
+                        await place_order_btn.click()
+                        log.info("✅ กด Place Order สำเร็จ!")
+                        await page.wait_for_timeout(3000)
+                        log.info("URL หลัง Place Order: %s", page.url)
+                    except Exception as e:
+                        log.error("❌ กด Place Order ไม่สำเร็จ: %s", e)
                 else:
                     log.warning("=" * 60)
                     log.warning("⚠️  มีปัญหาในขั้นตอนชำระเงิน")
