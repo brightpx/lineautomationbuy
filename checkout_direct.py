@@ -85,8 +85,9 @@ def _dedup(variants: list[dict]) -> list[dict]:
 
 def _extract_variant_list(obj) -> list[dict]:
     """
-    ดึง {id, name} จาก list ของ variant objects โดยตรง
+    ดึง {id, name, available} จาก list ของ variant objects โดยตรง
     รองรับ key: productVariants, variants, skus
+    available: จำนวนสต็อก (0 = หมด, >0 = มีของ)
     """
     results: list[dict] = []
     if isinstance(obj, list):
@@ -97,7 +98,11 @@ def _extract_variant_list(obj) -> list[dict]:
                 and isinstance(item.get("name"), str)
                 and item.get("name")
             ):
-                results.append({"id": int(item["id"]), "name": str(item["name"])})
+                results.append({
+                    "id": int(item["id"]),
+                    "name": str(item["name"]),
+                    "available": int(item.get("available", 0))
+                })
     return results
 
 
@@ -189,7 +194,11 @@ def _recursive_id_name_search(obj, depth: int = 0, max_depth: int = 20) -> list[
             and isinstance(obj.get("name"), str)
             and obj.get("name")
         ):
-            results.append({"id": int(obj["id"]), "name": str(obj["name"])})
+            results.append({
+                "id": int(obj["id"]),
+                "name": str(obj["name"]),
+                "available": int(obj.get("available", 0))
+            })
         for v in obj.values():
             results.extend(_recursive_id_name_search(v, depth + 1, max_depth))
     elif isinstance(obj, list):
@@ -201,7 +210,7 @@ def _recursive_id_name_search(obj, depth: int = 0, max_depth: int = 20) -> list[
 def parse_nuxt_flat_array(arr: list, product_id: int) -> list[dict]:
     """
     Nuxt serialize ข้อมูลเป็น flat array โดยค่าใน dict คือ INDEX ไปยัง element อื่น
-    เช่น: {'id': 47, 'variantOptionValue1': 48}  →  id=arr[47], name=arr[48]
+    เช่น: {'id': 47, 'variantOptionValue1': 48, 'available': 49}  →  id=arr[47], name=arr[48], available=arr[49]
     
     ค้นหา dict ที่มี key 'id' และ 'variantOptionValue1' (pattern ของ LINE Shopping variant)
     แล้ว dereference ค่าออกมา
@@ -218,6 +227,7 @@ def parse_nuxt_flat_array(arr: list, product_id: int) -> list[dict]:
 
         id_ref = item.get("id")
         name_ref = item.get("variantOptionValue1")
+        avail_ref = item.get("available")
 
         # ต้องเป็น index (int) ที่ valid
         if not isinstance(id_ref, int) or not isinstance(name_ref, int):
@@ -227,9 +237,28 @@ def parse_nuxt_flat_array(arr: list, product_id: int) -> list[dict]:
 
         actual_id = arr[id_ref]
         actual_name = arr[name_ref]
+        
+        # dereference available (อาจเป็น direct value หรือ index)
+        actual_available = 0
+        if isinstance(avail_ref, int):
+            if 0 <= avail_ref < n:
+                # เป็น index
+                val = arr[avail_ref]
+                if isinstance(val, (int, float)):
+                    actual_available = int(val)
+                else:
+                    # avail_ref อาจเป็นค่าจริง
+                    actual_available = avail_ref
+            else:
+                # เป็นค่าจริง (ไม่ใช่ index)
+                actual_available = avail_ref
 
         if isinstance(actual_id, (int, float)) and isinstance(actual_name, str) and actual_name:
-            results.append({"id": int(actual_id), "name": actual_name})
+            results.append({
+                "id": int(actual_id),
+                "name": actual_name,
+                "available": actual_available
+            })
 
     return _dedup(results)
 
@@ -569,17 +598,13 @@ async def select_promptpay(page: Page) -> bool:
                             disabled = await btn.is_disabled()
                             if not disabled:
                                 await btn.click(timeout=3_000)
-                                log.info("✓ กด '%s' สำเร็จ", sel)
                                 clicked_checkout = True
                                 break
-                            else:
-                                log.debug("  '%s' disabled — ข้าม", sel)
                     except Exception as e:
-                        log.debug("  '%s' error: %s", sel, e)
                         continue
 
                 if not clicked_checkout:
-                    log.warning("⚠️  ไม่พบปุ่ม Checkout — ดำเนินการต่อ")
+                    pass
 
                 # รอออกจาก /checkout/cart หรือรอ PromptPay ปรากฏ
                 try:
@@ -590,20 +615,17 @@ async def select_promptpay(page: Page) -> bool:
                         "      )",
                         timeout=15_000,
                     )
-                    log.info("✓ ออกจาก cart หรือ PromptPay ปรากฏ: %s", page.url)
                 except PWTimeout:
-                    log.warning("⚠️  ยังอยู่หน้า cart หลัง 15s: %s", page.url)
+                    pass
 
         # ── Step B: รอ payment section ──
-        log.info("รอ payment section โหลด...")
         try:
             await page.wait_for_selector(
                 'input[type="radio"], button:has-text("Place Order"), button:has-text("สั่งซื้อ")',
                 state="attached", timeout=20_000
             )
-            log.info("✓ payment section พร้อมแล้ว")
         except PWTimeout:
-            log.warning("⚠️  payment section ไม่ปรากฏใน 20s — ดำเนินการต่อ")
+            pass
 
         try:
             await page.keyboard.press("Escape")
@@ -612,7 +634,6 @@ async def select_promptpay(page: Page) -> bool:
             pass
 
         # ── Step C: ปิด popup/overlay ก่อน แล้วเลือก PromptPay ──
-        log.info("ปิด popup ก่อนเลือก PromptPay...")
         # กด Escape + ปิดปุ่มปิดทุกแบบ
         for _ in range(3):
             await close_popup(page, "before-promptpay")
@@ -686,7 +707,6 @@ async def select_promptpay(page: Page) -> bool:
         """)
         
         if pp_result and pp_result.get("ok"):
-            log.info("คลิก PromptPay <%s> cls='%s'", pp_result.get("tag"), pp_result.get("cls"))
             await page.wait_for_timeout(1000)
             
             # ตรวจสอบ aria-checked
@@ -717,10 +737,9 @@ async def select_promptpay(page: Page) -> bool:
 
         # ── Step D: ตรวจผลและหา Place Order button ──
         if not pp_clicked:
-            log.warning("⚠️  เลือก PromptPay ไม่สำเร็จ — browser จะเปิดค้างไว้")
-            log.warning("⚠️  เลือก PromptPay ด้วยมือแล้วกลับมากด Enter")
-        else:
-            log.info("✓ PromptPay เลือกแล้ว")
+            log.warning("⚠️  เลือก PromptPay ไม่สำเร็จ")
+            return False
+            
         place_order_btn = page.locator(
             'button:has-text("Place Order"), button:has-text("สั่งซื้อ"), '
             '[role="button"]:has-text("Place Order"), [role="button"]:has-text("สั่งซื้อ")'
@@ -736,7 +755,6 @@ async def select_promptpay(page: Page) -> bool:
         except Exception:
             pass
 
-        log.info("พร้อม Place Order (pp_clicked=%s)", pp_clicked)
         return True
 
     except PWTimeout as e:
@@ -762,10 +780,8 @@ async def run(config: dict) -> None:
     product_id = parse_product_id(product_url)
     shop_handle = parse_shop_handle(product_url)
 
-    log.info("Product URL   : %s", product_url)
-    log.info("Product ID    : %d", product_id)
-    log.info("Shop handle   : %s", shop_handle)
-    log.info("Preferred sizes: %s", preferred_sizes)
+    log.info("🛍️  Product: %s (ID: %d)", shop_handle, product_id)
+    log.info("📏 Sizes: %s", preferred_sizes)
 
     # ── ขั้นที่ 1: ดึง product info และ variants ผ่าน HTTP (ไม่เปิด browser) ──
     variants: list[dict] = []
@@ -780,29 +796,49 @@ async def run(config: dict) -> None:
         log.error("❌ ไม่สามารถดึง variants ได้จาก HTTP")
         return
 
-    log.info("=== Variants ที่พบ (%d รายการ) ===", len(variants))
-    for v in variants:
-        log.info("  id=%-12d  name='%s'", v["id"], v["name"])
-    log.info("=====================================")
+    variant_names = [v['name'] for v in variants]
+    log.info("📦 Variants (%d): %s", len(variants), ', '.join(variant_names))
 
     # ── ขั้นที่ 2: หา variant ที่ตรง size ──
-    matched_variant: dict | None = None
-    matched_size: str = ""
-    for size in preferred_sizes:
-        for v in variants:
-            if v["name"].strip().lower() == size.strip().lower():
-                matched_variant = v
-                matched_size = size
+    check_interval = config.get("check_interval_seconds", 30)
+    
+    while True:
+        matched_variant: dict | None = None
+        matched_size: str = ""
+        
+        for size in preferred_sizes:
+            for v in variants:
+                if v["name"].strip().lower() == size.strip().lower():
+                    matched_variant = v
+                    matched_size = size
+                    break
+            if matched_variant:
                 break
-        if matched_variant:
+
+        if not matched_variant:
+            log.error("❌ ไม่พบ size %s ในรายการ variants", preferred_sizes)
+            log.error("   Size ที่มีอยู่: %s", [v["name"] for v in variants])
+            return
+
+        # ตรวจสอบสต็อก
+        stock = matched_variant.get("available", 0)
+        
+        if stock > 0:
+            log.info("✅ เลือก: %s (ID: %d) — มีสต็อก: %d", matched_size, matched_variant["id"], stock)
             break
-
-    if not matched_variant:
-        log.error("❌ ไม่พบ size %s ในรายการ variants", preferred_sizes)
-        log.error("   Size ที่มีอยู่: %s", [v["name"] for v in variants])
-        return
-
-    log.info("✓ พบ variant: id=%d  name='%s'", matched_variant["id"], matched_size)
+        else:
+            log.warning("⏳ Size '%s' หมดสต็อก — รอตรวจสอบอีกครั้งใน %d วินาที...", matched_size, check_interval)
+            await asyncio.sleep(check_interval)
+            
+            # ดึง variants ใหม่
+            try:
+                variants = await fetch_variants_via_http(product_url, product_id, session_file)
+                if not variants:
+                    log.error("❌ ไม่สามารถดึง variants ได้ — หยุดการตรวจสอบ")
+                    return
+            except Exception as e:
+                log.warning("HTTP fetch ล้มเหลว: %s — ข้ามรอบนี้", e)
+                continue
 
     # ── ขั้นที่ 3: สร้าง Checkout URL ──
     checkout_url = build_checkout_url(
@@ -810,17 +846,16 @@ async def run(config: dict) -> None:
         product_id=product_id,
         variant_id=matched_variant["id"],
     )
-    log.info("Checkout URL: %s", checkout_url)
 
     # ── ขั้นที่ 4: เปิด browser (headless) และทำ checkout โดยอัตโนมัติ ──
     session_kwargs: dict = {}
     if Path(session_file).exists():
         session_kwargs["storage_state"] = session_file
 
-    log.info("กำลังเปิด browser (headless) และดำเนินการ checkout...")
+    log.info("🌐 เปิด browser...")
     async with async_playwright() as pw:
         browser = await pw.chromium.launch(
-            headless=True,  # ไม่แสดงหน้าต่าง browser
+            headless=True,
             args=[
                 "--disable-extensions",
                 "--disable-default-apps",
@@ -832,9 +867,9 @@ async def run(config: dict) -> None:
         context = await browser.new_context(**session_kwargs)
         page = await context.new_page()
 
-        log.info("กำลังเปิด Checkout URL...")
         await page.goto(checkout_url, wait_until="domcontentloaded", timeout=15_000)
-        log.info("✅ ถึงหน้า checkout: %s", page.url)
+        log.info("✅ ถึงหน้า checkout")
+        log.info("🔗 URL: %s", page.url)
 
         # ── ขั้นที่ 5: เลือก PromptPay ──
         paid = await select_promptpay(page)
@@ -843,7 +878,7 @@ async def run(config: dict) -> None:
             await browser.close()
             return
 
-        log.info("✅ เลือก PromptPay สำเร็จ!")
+        log.info("💳 เลือก PromptPay แล้ว")
 
         # ปิด popup ก่อน Place Order
         try:
@@ -856,14 +891,10 @@ async def run(config: dict) -> None:
         # ── ขั้นที่ 6: ดึงราคาจริงจากหน้า checkout ──
         actual_price = ""
         try:
-            # รอให้ราคาโหลดก่อน
             await page.wait_for_timeout(500)
             
-            # ดึง text ทั้งหมดที่มี ฿
             all_prices = await page.locator('text=/฿\\s*[0-9,]+/').all_text_contents()
-            log.info("ราคาทั้งหมดที่พบ: %s", all_prices)
             
-            # หาตัวเลขที่ใหญ่ที่สุด (มักเป็นราคารวม)
             max_price = 0
             for price_text in all_prices:
                 import re
@@ -875,9 +906,6 @@ async def run(config: dict) -> None:
             
             if max_price > 0:
                 actual_price = str(max_price)
-                log.info("ดึงราคาจากหน้า checkout: ฿%s", actual_price)
-            else:
-                log.warning("ไม่พบราคาในหน้า checkout")
         except Exception as e:
             log.warning("ไม่สามารถดึงราคาจากหน้า checkout: %s", e)
 
@@ -908,30 +936,23 @@ async def run(config: dict) -> None:
         ).first
 
         try:
-            log.info("กำลังกด Place Order...")
-            
-            # ตรวจสอบ URL ก่อนกด
             url_before = page.url
-            log.info("URL ก่อนกด Place Order: %s", url_before)
             
             await place_order_btn.click(timeout=5_000)
-            log.info("✅ กด Place Order สำเร็จ!")
+            log.info("🛒 กด Place Order...")
             
             # รอให้มีการ navigate หรือ response
             try:
                 await page.wait_for_load_state("networkidle", timeout=10_000)
             except Exception:
-                log.warning("Timeout รอ networkidle")
+                pass
             
             await page.wait_for_timeout(3000)
             
             url_after = page.url
-            log.info("URL หลัง Place Order: %s", url_after)
             
             # ตรวจสอบว่า URL เปลี่ยนหรือไม่
             if url_before == url_after:
-                log.warning("⚠️ URL ไม่เปลี่ยน - อาจไม่ได้ submit order จริง")
-                log.info("กำลังตรวจสอบ error messages...")
                 
                 # หา error messages
                 error_selectors = [
