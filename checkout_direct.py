@@ -502,7 +502,7 @@ async def close_popup(page: Page, context: str = "") -> bool:
     """ปิด popup/modal ที่อาจขวาง"""
     try:
         await page.keyboard.press("Escape")
-        await page.wait_for_timeout(150)
+        await page.wait_for_load_state("domcontentloaded", timeout=500)
     except Exception:
         pass
 
@@ -518,12 +518,11 @@ async def close_popup(page: Page, context: str = "") -> bool:
             if await btn.is_visible(timeout=500):
                 log.info("  พบ popup (%s) — ปิด...", context)
                 await btn.click(timeout=2000, force=True)
-                await page.wait_for_timeout(200)
+                await page.wait_for_load_state("domcontentloaded", timeout=500)
                 log.info("  ✓ ปิด popup สำเร็จ")
                 return True
         except Exception:
             pass
-        await page.wait_for_timeout(300)
     return False
 
 
@@ -546,7 +545,6 @@ async def select_promptpay(page: Page) -> bool:
                 await page.wait_for_load_state("networkidle", timeout=10_000)
             except PWTimeout:
                 pass
-            await page.wait_for_timeout(500)
 
             # dump ปุ่มทั้งหมดที่เห็น เพื่อ debug
             btn_texts = await page.evaluate("""
@@ -629,7 +627,6 @@ async def select_promptpay(page: Page) -> bool:
 
         try:
             await page.keyboard.press("Escape")
-            await page.wait_for_timeout(150)
         except Exception:
             pass
 
@@ -637,7 +634,6 @@ async def select_promptpay(page: Page) -> bool:
         # กด Escape + ปิดปุ่มปิดทุกแบบ
         for _ in range(3):
             await close_popup(page, "before-promptpay")
-            await page.wait_for_timeout(200)
 
         # ปิด overlay โดยตรงผ่าน JS (บาง popup ไม่มีปุ่มปิด)
         dismissed = await page.evaluate("""
@@ -667,7 +663,6 @@ async def select_promptpay(page: Page) -> bool:
         """)
         if dismissed:
             log.info("  ปิด popup/overlay: %s", dismissed)
-            await page.wait_for_timeout(400)
 
         log.info("เลือก PromptPay...")
         pp_clicked = False
@@ -707,8 +702,6 @@ async def select_promptpay(page: Page) -> bool:
         """)
         
         if pp_result and pp_result.get("ok"):
-            await page.wait_for_timeout(1000)
-            
             # ตรวจสอบ aria-checked
             after_state = await page.evaluate("""
                 () => {
@@ -733,8 +726,6 @@ async def select_promptpay(page: Page) -> bool:
         else:
             log.warning("⚠️  ไม่พบ PromptPay element")
 
-        await page.wait_for_timeout(300)
-
         # ── Step D: ตรวจผลและหา Place Order button ──
         if not pp_clicked:
             log.warning("⚠️  เลือก PromptPay ไม่สำเร็จ")
@@ -751,7 +742,6 @@ async def select_promptpay(page: Page) -> bool:
 
         try:
             await place_order_btn.scroll_into_view_if_needed()
-            await page.wait_for_timeout(150)
         except Exception:
             pass
 
@@ -871,10 +861,19 @@ async def run(config: dict) -> None:
                 "--no-first-run",
                 "--disable-sync",
                 "--disable-translate",
+                "--disable-blink-features=AutomationControlled",
             ],
         )
         context = await browser.new_context(**session_kwargs)
+        
+        # Block unnecessary resources for faster page load
+        await context.route("**/*", lambda route: (
+            route.abort() if route.request.resource_type in ["image", "font", "media", "stylesheet"]
+            else route.continue_()
+        ))
+        
         page = await context.new_page()
+        page.set_default_timeout(5000)
 
         await page.goto(checkout_url, wait_until="domcontentloaded", timeout=15_000)
         log.info("✅ ถึงหน้า checkout")
@@ -895,13 +894,10 @@ async def run(config: dict) -> None:
         except Exception:
             pass
         await close_popup(page, "before-place-order")
-        await page.wait_for_timeout(300)
 
         # ── ขั้นที่ 6: ดึงราคาจริงจากหน้า checkout ──
         actual_price = ""
         try:
-            await page.wait_for_timeout(1000)
-            
             import re
             
             # DEBUG: dump HTML เพื่อตรวจสอบ
@@ -969,29 +965,34 @@ async def run(config: dict) -> None:
             except Exception:
                 pass
             
-            await page.wait_for_timeout(3000)
-            
             url_after = page.url
             
             # ตรวจสอบว่า URL เปลี่ยนหรือไม่
             if url_before == url_after:
                 
-                # หา error messages
+                # หา error messages (กรองคำที่ไม่ใช่ error)
                 error_selectors = [
                     'text=/error/i',
                     'text=/ผิดพลาด/i',
-                    'text=/หมด/i',
                     '[role="alert"]',
                     '[class*="error"]',
                     '[class*="Error"]',
                 ]
+                
+                # คำที่ไม่ใช่ error - ต้องกรองออก
+                ignore_texts = ['ดูทั้งหมด', 'รวมทั้งหมด', 'total', 'view all', 'see all']
                 
                 found_errors = []
                 for sel in error_selectors:
                     try:
                         errors = await page.locator(sel).all_text_contents()
                         if errors:
-                            found_errors.extend(errors)
+                            # กรองเฉพาะข้อความที่ไม่ใช่คำทั่วไป
+                            filtered = [
+                                e.strip() for e in errors 
+                                if e.strip() and e.strip().lower() not in ignore_texts
+                            ]
+                            found_errors.extend(filtered)
                     except Exception:
                         pass
                 
@@ -1021,6 +1022,7 @@ async def run(config: dict) -> None:
                 return
             else:
                 log.info("✅ URL เปลี่ยนแล้ว - น่าจะ submit สำเร็จ")
+                log.info("🔗 URL หลัง Place Order: %s", url_after)
                 
                 # ตรวจสอบว่าไป payment page หรือ success page หรือไม่
                 if "payment" in url_after or "success" in url_after or "order" in url_after:
@@ -1038,7 +1040,10 @@ async def run(config: dict) -> None:
                 
                 # รอ QR code หรือ payment page
                 log.info("รอ QR code หรือ payment page...")
-                await page.wait_for_timeout(3000)
+                try:
+                    await page.wait_for_load_state("networkidle", timeout=5_000)
+                except Exception:
+                    pass
                 
                 try:
                     await page.screenshot(path="debug_payment_page.png")
@@ -1047,8 +1052,6 @@ async def run(config: dict) -> None:
                     pass
 
         log.info("✅ เสร็จสิ้น - ปิด browser")
-        await browser.close()
-
         await browser.close()
 
 
