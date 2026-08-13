@@ -1,8 +1,9 @@
 {
-  "product_url": "https://shop.line.me/@thelandofvava/product/1008229810",
-  "preferred_sizes": ["12m", "2y", "3y"],
+  "product_url": "https://shop.line.me/@be_bekids/product/1008243591",
+  "preferred_sizes": ["12-18m", "2y", "3y"],
   "check_interval": 5,
   "headless": false,
   "session_file": "line_session.json",
-  "is_test": false
+  "is_test": true,
+  "debug_screenshots": false
 }
