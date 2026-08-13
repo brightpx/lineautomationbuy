@@ -96,57 +96,45 @@ async def close_popup(page: Page, context: str = "") -> bool:
     Returns:
         True ถ้าปิดสำเร็จ, False ถ้าไม่เจอ popup
     """
-    close_selectors = [
-        "button:has-text('×')",
-        "button:has-text('X')",
-        "button:has-text('Close')",
-        "button:has-text('ปิด')",
-        "button:has-text('Got it')",
-        "button:has-text('รับทราบ')",
-        "button:has-text('ไม่ใช้')",
-        "[data-testid*='close']",
-        "[aria-label*='close' i]",
-        "button[class*='close' i]",
-        "[role='dialog'] button:has-text('Close')",
-        "[role='dialog'] button:has-text('ปิด')",
-    ]
-
-    # ลอง Escape key ก่อน
+    # ลอง Escape key ก่อน (เร็วที่สุด)
     try:
         await page.keyboard.press("Escape")
-        await page.wait_for_timeout(200)
+        await page.wait_for_timeout(150)
     except:
         pass
 
-    # ลองปิดด้วย selector (ลดจาก 6 รอบ → 2 รอบ)
+    # Combined selector — ตรวจทีเดียวแทนการ loop 12 ตัว (ลด IPC round-trips)
+    combined_selector = (
+        "button:has-text('×'), button:has-text('X'), button:has-text('Close'), "
+        "button:has-text('ปิด'), button:has-text('Got it'), button:has-text('รับทราบ'), "
+        "button:has-text('ไม่ใช้'), [data-testid*='close'], [aria-label*='close' i], "
+        "button[class*='close' i]"
+    )
+
     for attempt in range(2):
-        for selector in close_selectors:
-            try:
-                close_btn = page.locator(selector).first
-                if await close_btn.is_visible(timeout=1500):  # เพิ่มจาก 500ms → 1500ms รองรับเน็ตช้า
-                    btn_text = await close_btn.text_content() or ""
-                    log.info(f"  พบ popup ({context}) - ปิดด้วย: {selector}")
+        try:
+            close_btn = page.locator(combined_selector).first
+            if await close_btn.is_visible(timeout=500):
+                log.info(f"  พบ popup ({context}) — ปิด...")
 
-                    # เก็บ URL ก่อนคลิก
-                    url_before = page.url
-                    await close_btn.click(timeout=2000, force=True)
-                    await page.wait_for_timeout(300)
+                # เก็บ URL ก่อนคลิก
+                url_before = page.url
+                await close_btn.click(timeout=2000, force=True)
+                await page.wait_for_timeout(200)
 
-                    # ตรวจสอบว่าไม่ redirect ไปที่อื่น
-                    url_after = page.url
-                    if "/checkout/cart" in url_before and "/checkout/cart" not in url_after:
-                        log.warning(f"  ⚠️  ปุ่มนี้ redirect ไปที่: {url_after}")
-                        if "/product/" in url_after:
-                            return False  # ต้อง retry
-                        continue
-
-                    log.info(f"  ✓ ปิด popup สำเร็จ")
-                    return True
-            except:
-                continue
+                # ตรวจสอบว่าไม่ redirect ไปที่อื่น
+                url_after = page.url
+                if "/checkout/cart" in url_before and "/checkout/cart" not in url_after:
+                    log.warning(f"  ⚠️  ปุ่มนี้ redirect ไปที่: {url_after}")
+                    if "/product/" in url_after:
+                        return False
+                log.info(f"  ✓ ปิด popup สำเร็จ")
+                return True
+        except:
+            pass
 
         if attempt < 1:
-            await page.wait_for_timeout(500)
+            await page.wait_for_timeout(300)
 
     return False
 
@@ -158,6 +146,70 @@ async def select_size_button(page: Page, sizes: list[str]) -> tuple[bool, str]:
     Returns:
         (success: bool, selected_size: str)
     """
+    # ===== DEBUG: dump ทุก element ที่มีข้อความเกี่ยวกับไซส์ =====
+    try:
+        dump = await page.evaluate("""
+            (sizes) => {
+                const result = { exactMatch: [], containsMatch: [], dialogs: [], allButtons: [], zModalContent: '' };
+
+                // 1. หา z-modal container และ dump innerHTML
+                const zModal = document.querySelector('.z-modal, [class*="z-modal"]');
+                if (zModal) {
+                    result.zModalContent = zModal.innerHTML.slice(0, 2000);
+                }
+
+                // 2. หา dialogs/modals/bottom-sheets ที่เปิดอยู่
+                document.querySelectorAll('[role="dialog"], [role="bottomsheet"], [class*="modal" i], [class*="sheet" i], [class*="overlay" i]').forEach(el => {
+                    result.dialogs.push({ tag: el.tagName, role: el.getAttribute('role') || '', cls: (el.className||'').slice(0,80), visible: el.offsetParent !== null, childCount: el.children.length });
+                });
+
+                // 3. dump ปุ่มทั้งหมดพร้อม text (สูงสุด 50 ปุ่ม)
+                let btnCount = 0;
+                document.querySelectorAll('button, [role="button"]').forEach(el => {
+                    if (btnCount >= 50) return;
+                    const txt = (el.innerText || el.textContent || '').trim().replace(/\\s+/g, ' ');
+                    if (txt) {
+                        result.allButtons.push({ txt: txt.slice(0,100), tag: el.tagName, cls: (el.className||'').slice(0,60), disabled: el.disabled, visible: el.offsetParent !== null });
+                        btnCount++;
+                    }
+                });
+
+                // 4. TreeWalker หา exact match ใน text nodes
+                const walker = document.createTreeWalker(document.body, NodeFilter.SHOW_TEXT, null);
+                while (walker.nextNode()) {
+                    const txt = walker.currentNode.textContent.trim();
+                    if (!txt) continue;
+                    const el = walker.currentNode.parentElement;
+                    if (!el) continue;
+                    if (sizes.some(s => txt.toLowerCase() === s.toLowerCase())) {
+                        result.exactMatch.push({ text: txt, tag: el.tagName, role: el.getAttribute('role')||'', cls:(el.className||'').slice(0,80), disabled: el.disabled??null, outerHTML: el.outerHTML.slice(0,200) });
+                    } else if (sizes.some(s => txt.toLowerCase().includes(s.toLowerCase()))) {
+                        result.containsMatch.push({ text: txt.slice(0,120), tag: el.tagName, role: el.getAttribute('role')||'', cls:(el.className||'').slice(0,80) });
+                    }
+                }
+                return result;
+            }
+        """, sizes)
+        log.info("=== SIZE DOM DUMP ===")
+        log.info("z-modal innerHTML (first 500 chars): %s", dump.get('zModalContent','(empty)')[:500])
+        log.info("Dialogs/Modals open: %d", len(dump.get('dialogs', [])))
+        for d in dump.get('dialogs', []):
+            log.info("  [dialog] <%s> role='%s' visible=%s childCount=%d class='%s'", d['tag'], d['role'], d['visible'], d['childCount'], d['cls'])
+        log.info("Exact match elements: %d", len(dump.get('exactMatch', [])))
+        for d in dump.get('exactMatch', []):
+            log.info("  [exact] text='%s' <%s> role='%s' disabled=%s class='%s'", d['text'], d['tag'], d['role'], d['disabled'], d['cls'])
+            log.info("    HTML: %s", d['outerHTML'])
+        log.info("Contains-match elements: %d", len(dump.get('containsMatch', [])))
+        for d in dump.get('containsMatch', []):
+            log.info("  [contains] text='%s' <%s> role='%s' class='%s'", d['text'], d['tag'], d['role'], d['cls'])
+        log.info("All buttons (%d):", len(dump.get('allButtons', [])))
+        for b in dump.get('allButtons', []):
+            log.info("  [btn] <%s> disabled=%s visible=%s text='%s' class='%s'", b['tag'], b['disabled'], b['visible'], b['txt'], b['cls'])
+        log.info("=== END SIZE DOM DUMP ===")
+    except Exception as e:
+        log.warning("DEBUG dump ล้มเหลว: %s", e)
+    # ================================================================
+
     selectors_template = [
         'button:text("{size}")',
         '[role="button"]:text("{size}")',
@@ -255,11 +307,16 @@ async def check_size_in_stock(page: Page, sizes: list[str]) -> tuple[bool, str]:
         buy_btn = page.get_by_role("button", name="Buy Now", exact=True)
         await buy_btn.last.click(timeout=1_500, force=True)
 
-        # รอ modal ปรากฏและโหลดเสร็จ
+        # รอ modal เปิดจริง ๆ: รอให้ปุ่มเพิ่มขึ้นจาก 5 (หน้าหลัก) เป็น >5 (modal เพิ่มปุ่มไซส์)
+        # selector 'y'/'m' เดิมผิดพลาดเพราะ "Buy Now" บนหน้าหลักมีตัว 'y' อยู่แล้ว
         try:
-            await page.wait_for_selector("button[role='button']:has-text('y'), button[role='button']:has-text('m')", timeout=2500)  # เพิ่มจาก 800ms → 2500ms รองรับเน็ตช้า
+            await page.wait_for_function(
+                "() => document.querySelectorAll('button').length > 5",
+                timeout=3000
+            )
+            log.info("✓ Modal เปิดแล้ว — พบปุ่มเพิ่มขึ้น")
         except:
-            pass
+            log.warning("Modal อาจยังไม่เปิด — ลองต่อ")
 
         await page.wait_for_timeout(50)
 
@@ -287,14 +344,19 @@ async def check_size_in_stock(page: Page, sizes: list[str]) -> tuple[bool, str]:
 
 
 async def is_product_available(page: Page) -> bool:
-    """คืนค่า True ถ้าปุ่ม Buy Now ไม่ถูก disabled"""
+    """คืนค่า True ถ้าปุ่ม Buy Now ไม่ถูก disabled — ใช้ JS inject แทน Playwright locator (เร็วกว่า)"""
     try:
-        btn = page.get_by_role("button", name="Buy Now", exact=True)
-        if await btn.count() == 0:
-            btn = page.get_by_role("button", name="ซื้อเลย", exact=True)
-        if await btn.count() == 0:
-            return False
-        return not await btn.first.is_disabled()
+        return await page.evaluate("""
+            () => {
+                const btns = document.querySelectorAll('button');
+                for (const btn of btns) {
+                    const txt = btn.textContent?.trim();
+                    if ((txt === 'Buy Now' || txt === 'ซื้อเลย') && !btn.disabled)
+                        return true;
+                }
+                return false;
+            }
+        """)
     except Exception:
         return False
 
@@ -346,14 +408,13 @@ async def proceed_to_checkout(page: Page, sizes: list[str], debug_screenshots: b
                 await save_screenshot(page, "debug_click_failed.png", debug_screenshots)
                 return False, "error"
 
-            # Step 2 — รอให้ปุ่มไซส์ปรากฏ
+            # Step 2 — รอให้ modal เปิดจริง: ปุ่มในหน้าเพิ่มขึ้นจาก 5 (หน้าหลัก) เป็นมากกว่านั้น
             try:
-                await page.wait_for_selector(
-                    "button:has-text('y'), button:has-text('m'), [class*='size'] button, [class*='Size'] button",
-                    timeout=1_200,
-                    state="visible"
+                await page.wait_for_function(
+                    "() => document.querySelectorAll('button').length > 5",
+                    timeout=2_000
                 )
-                log.info("✓ Modal เปิดแล้ว — พบปุ่มไซส์")
+                log.info("✓ Modal เปิดแล้ว — พบปุ่มเพิ่มขึ้น")
             except:
                 log.warning("Modal อาจยังโหลดไม่เสร็จ — ลองต่อ")
 
@@ -511,12 +572,12 @@ async def select_promptpay(page: Page, debug_screenshots: bool = False) -> bool:
             await close_popup(page, "cart-checkout")
             await page.wait_for_timeout(200)
 
-            # รอ networkidle ให้ Vue render เสร็จ (สูงสุด 10s)
+            # ข้อ 2: เปลี่ยนจาก networkidle → domcontentloaded (เร็วกว่ามาก)
             try:
-                await page.wait_for_load_state("networkidle", timeout=10_000)
-                log.info("✓ networkidle แล้ว")
+                await page.wait_for_load_state("domcontentloaded", timeout=5_000)
+                log.info("✓ domcontentloaded แล้ว")
             except PWTimeout:
-                log.warning("⚠️  networkidle timeout — ดำเนินการต่อ")
+                log.warning("⚠️  domcontentloaded timeout — ดำเนินการต่อ")
 
             # รอปุ่ม Place Order ขึ้นบน cart page (Vue render) สูงสุด 15s
             try:
@@ -784,15 +845,29 @@ async def monitor_and_buy(playwright, product_url: str, preferred_sizes: list[st
     else:
         log.warning("ไม่พบ session file — อาจต้องล็อกอินก่อน (รัน: python bot.py login)")
 
-    browser = await playwright.chromium.launch(headless=headless)
+    # ข้อ 3: เพิ่ม browser flags เพื่อลด overhead
+    browser = await playwright.chromium.launch(
+        headless=headless,
+        args=[
+            "--disable-extensions",
+            "--disable-background-networking",
+            "--disable-default-apps",
+            "--no-first-run",
+            "--disable-sync",
+            "--disable-translate",
+            "--disable-background-timer-throttling",
+        ]
+    )
 
-    # Block ทรัพยากรที่ไม่จำเป็น เพื่อโหลดหน้าเร็วขึ้น
     context = await browser.new_context(**session_kwargs)
 
-    # Block ทรัพยากรที่ไม่จำเป็น
+    # Block ทรัพยากรที่ไม่จำเป็น รวม analytics/tracking (ข้อ 6)
     async def block_resources(route):
         resource_type = route.request.resource_type
+        url = route.request.url
         if resource_type in ['image', 'stylesheet', 'font', 'media']:
+            await route.abort()
+        elif any(x in url for x in ['analytics', 'gtm', 'googletagmanager', 'facebook', 'hotjar', 'clarity', 'doubleclick']):
             await route.abort()
         else:
             await route.continue_()
@@ -812,16 +887,20 @@ async def monitor_and_buy(playwright, product_url: str, preferred_sizes: list[st
     while True:
         attempt += 1
         try:
-            # โหลดหน้าครั้งแรก หรือเมื่อไม่ได้อยู่ที่หน้าสินค้า
+            # ข้อ 4: ใช้ reload() ตั้งแต่รอบที่ 2 เป็นต้นไป (เร็วกว่า goto เพราะ reuse connection)
             if attempt == 1 or "/product/" not in page.url:
                 await page.goto(product_url, wait_until="domcontentloaded", timeout=10_000)
 
                 # ครั้งแรก: รอให้หน้าโหลดเสร็จจริง ๆ
                 if attempt == 1:
                     log.info("โหลดหน้าครั้งแรก — รอให้หน้าโหลดเสร็จ...")
-                    await page.wait_for_timeout(1500)
+                    await page.wait_for_timeout(500)  # ลดจาก 1500 → 500ms
                 else:
-                    await page.wait_for_timeout(400)
+                    await page.wait_for_timeout(100)  # ลดจาก 400 → 100ms
+            else:
+                # รอบที่ 2+ ที่ยังอยู่หน้า product: reload แทน goto (เร็วกว่า)
+                await page.reload(wait_until="domcontentloaded", timeout=8_000)
+                await page.wait_for_timeout(100)
 
             available = await is_product_available(page)
 

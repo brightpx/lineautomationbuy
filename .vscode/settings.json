@@ -1,0 +1,12 @@
+{
+    "chat.tools.terminal.autoApprove": {
+        "/^python bot\\.py$/": {
+            "approve": true,
+            "matchCommandLine": true
+        },
+        "/^python bot\\.py 2>&1 \\| Select-String -Pattern \"SIZE DOM\\|z-modal\\|dialog\\|exact\\|contains\\|All buttons\\|btn\\|modal\\|Modal\" \\| Select-Object -First 80$/": {
+            "approve": true,
+            "matchCommandLine": true
+        }
+    }
+}
