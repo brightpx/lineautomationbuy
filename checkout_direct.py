@@ -785,9 +785,15 @@ def parse_sale_time(time_str: str) -> dt_time:
     return dt_time(h, m, s)
 
 
-async def fetch_shop_products(shop_url: str, session_file: str) -> list[dict]:
+async def fetch_shop_products(
+    shop_url: str, 
+    session_file: str,
+    browser: Optional[Browser] = None,
+    context: Optional[BrowserContext] = None
+) -> list[dict]:
     """
     ดึงรายการสินค้าทั้งหมดจากหน้าร้าน (ใช้ Playwright เพื่อรอ JavaScript โหลด)
+    browser/context: ถ้าส่งมา = ใช้ instance เดียวกัน (เร็วขึ้นมาก)
     คืน list[{"id": int, "url": str, "name": str}]
     """
     from playwright.async_api import async_playwright
@@ -795,6 +801,22 @@ async def fetch_shop_products(shop_url: str, session_file: str) -> list[dict]:
     products: list[dict] = []
     shop_handle = parse_shop_handle(shop_url)
     
+    # ถ้ามี browser/context ส่งมาแล้ว = ใช้เลย (เร็วขึ้น)
+    if browser and context:
+        page = await context.new_page()
+        try:
+            await page.goto(shop_url, wait_until="domcontentloaded", timeout=10000)
+            try:
+                await page.wait_for_selector('a[href*="/product/"]', timeout=3000)
+            except Exception:
+                log.debug("ไม่พบ product links ภายใน 3 วินาที")
+            
+            products = await _extract_products_from_page(page, shop_handle)
+        finally:
+            await page.close()
+        return products
+    
+    # ถ้าไม่มี browser/context = เปิด-ปิดใหม่ (ช้า)
     async with async_playwright() as p:
         browser = await p.chromium.launch(headless=True)
         context = await browser.new_context()
@@ -818,62 +840,69 @@ async def fetch_shop_products(shop_url: str, session_file: str) -> list[dict]:
             except Exception:
                 log.debug("ไม่พบ product links ภายใน 3 วินาที")
             
-            # Extract products from DOM
-            product_links = await page.query_selector_all('a[href*="/product/"]')
-            seen_ids: set[int] = set()
-            
-            for link in product_links:
-                try:
-                    href = await link.get_attribute('href')
-                    if not href:
-                        continue
-                    
-                    # Extract product ID from URL
-                    # Format: /@shop_handle/product/123456 or /product/123456
-                    m = re.search(r'/product/(\d+)', href)
-                    if not m:
-                        continue
-                    
-                    product_id = int(m.group(1))
-                    if product_id <= 10000 or product_id in seen_ids:
-                        continue
-                    
-                    # Get product name from link text or image alt
-                    name = await link.text_content() or ""
-                    name = name.strip()
-                    
-                    # If no text, try to get from img alt
-                    if not name:
-                        img = await link.query_selector('img')
-                        if img:
-                            name = await img.get_attribute('alt') or ""
-                            name = name.strip()
-                    
-                    if not name:
-                        name = f"Product {product_id}"
-                    
-                    seen_ids.add(product_id)
-                    
-                    # Build full URL
-                    if href.startswith('http'):
-                        url = href
-                    elif href.startswith('/'):
-                        url = f"https://shop.line.me{href}"
-                    else:
-                        url = f"https://shop.line.me/{shop_handle}/product/{product_id}"
-                    
-                    products.append({
-                        "id": product_id,
-                        "url": url,
-                        "name": name,
-                    })
-                
-                except Exception as e:
-                    log.debug("ข้าม product link: %s", e)
-                    continue
+            products = await _extract_products_from_page(page, shop_handle)
         
         finally:
             await browser.close()
+    
+    return products
+
+
+async def _extract_products_from_page(page: Page, shop_handle: str) -> list[dict]:
+    """ดึง products จาก DOM ของ page ที่เปิดอยู่แล้ว"""
+    products: list[dict] = []
+    product_links = await page.query_selector_all('a[href*="/product/"]')
+    seen_ids: set[int] = set()
+    
+    for link in product_links:
+        try:
+            href = await link.get_attribute('href')
+            if not href:
+                continue
+            
+            # Extract product ID from URL
+            # Format: /@shop_handle/product/123456 or /product/123456
+            m = re.search(r'/product/(\d+)', href)
+            if not m:
+                continue
+            
+            product_id = int(m.group(1))
+            if product_id <= 10000 or product_id in seen_ids:
+                continue
+            
+            # Get product name from link text or image alt
+            name = await link.text_content() or ""
+            name = name.strip()
+            
+            # If no text, try to get from img alt
+            if not name:
+                img = await link.query_selector('img')
+                if img:
+                    name = await img.get_attribute('alt') or ""
+                    name = name.strip()
+            
+            if not name:
+                name = f"Product {product_id}"
+            
+            seen_ids.add(product_id)
+            
+            # Build full URL
+            if href.startswith('http'):
+                url = href
+            elif href.startswith('/'):
+                url = f"https://shop.line.me{href}"
+            else:
+                url = f"https://shop.line.me/{shop_handle}/product/{product_id}"
+            
+            products.append({
+                "id": product_id,
+                "url": url,
+                "name": name,
+            })
+        
+        except Exception as e:
+            log.debug("ข้าม product link: %s", e)
+            continue
     
     return products
 
@@ -978,85 +1007,104 @@ async def monitor_shop_for_new_products(
     log.info("   🎯 Pattern: %s", product_name_pattern or "(ทุกสินค้า)")
     print("\n💡 กดปุ่มใดก็ได้เพื่อหยุด polling และเลือกสินค้าด้วย arrow keys\n")
 
-    while True:
-        try:
-            # ตรวจจับ keyboard interrupt (Windows)
-            if sys.platform == 'win32' and msvcrt.kbhit():
-                msvcrt.getch()  # consume the key
-                log.info("⏸️  ตรวจพบการกดปุ่ม — หยุด polling ชั่วคราว")
-                print("\n⏸️  หยุด polling ชั่วคราว...\n")
-                
-                # fetch products ปัจจุบัน
-                current = await fetch_shop_products(shop_url, session_file)
-                if not current:
-                    print("❌ ไม่พบสินค้าในขณะนี้ — กลับไป polling\n")
-                    log.warning("ไม่พบสินค้า — กลับไป polling")
-                    await asyncio.sleep(1)
-                    continue
-                
-                # แสดง interactive menu
-                print(f"📦 พบสินค้าทั้งหมด: {len(current)} รายการ\n")
-                selected = await select_product_interactive(current)
-                
-                print(f"\n✅ เลือก: \033[96m{selected['name']}\033[0m")
-                print(f"   ID: {selected['id']}")
-                print(f"   URL: {selected['url']}\n")
-                log.info("✅ เลือกสินค้า: %s", selected["name"])
-                log.info("   ID: %d", selected["id"])
-                log.info("   URL: %s", selected["url"])
-                return selected
-            
-            poll_count += 1
-            poll_time = datetime.now().strftime("%H:%M:%S.%f")[:-3]
-            log.info("🔄 Poll #%d [%s] กำลังตรวจสอบร้าน...", poll_count, poll_time)
-            
-            current = await fetch_shop_products(shop_url, session_file)
-            current_ids = {p["id"] for p in current}
-            new_ids = current_ids - baseline_ids
-            
-            log.info("   📊 สินค้าทั้งหมด: %d | ใหม่: %d", len(current_ids), len(new_ids))
+    # สร้าง browser instance เดียวสำหรับ polling ทั้งหมด (เร็วขึ้นมาก)
+    from playwright.async_api import async_playwright
+    pw = await async_playwright().start()
+    poll_browser = await pw.chromium.launch(headless=True)
+    poll_context = await poll_browser.new_context()
+    
+    # Load session cookies if available
+    if Path(session_file).exists():
+        with open(session_file, encoding="utf-8") as f:
+            session = json.load(f)
+            if "cookies" in session:
+                await poll_context.add_cookies(session["cookies"])
 
-            if new_ids:
-                new_products = [p for p in current if p["id"] in new_ids]
-                print("\n" + "="*60)
-                print("🆕 ตรวจพบสินค้าใหม่ %d รายการ:" % len(new_products))
-                print("="*60)
-                for p in new_products:
-                    print(f"\033[92m   ✨ [{p['id']}] {p['name']}\033[0m")
-                print("="*60 + "\n")
-                log.info("🆕 ตรวจพบสินค้าใหม่ %d รายการ:", len(new_products))
-                for p in new_products:
-                    log.info("   • [%d] %s", p["id"], p["name"])
+    try:
+        while True:
+            try:
+                # ตรวจจับ keyboard interrupt (Windows)
+                if sys.platform == 'win32' and msvcrt.kbhit():
+                    msvcrt.getch()  # consume the key
+                    log.info("⏸️  ตรวจพบการกดปุ่ม — หยุด polling ชั่วคราว")
+                    print("\n⏸️  หยุด polling ชั่วคราว...\n")
+                    
+                    # fetch products ปัจจุบัน
+                    current = await fetch_shop_products(shop_url, session_file, poll_browser, poll_context)
+                    if not current:
+                        print("❌ ไม่พบสินค้าในขณะนี้ — กลับไป polling\n")
+                        log.warning("ไม่พบสินค้า — กลับไป polling")
+                        await asyncio.sleep(1)
+                        continue
+                    
+                    # แสดง interactive menu
+                    print(f"📦 พบสินค้าทั้งหมด: {len(current)} รายการ\n")
+                    selected = await select_product_interactive(current)
+                    
+                    print(f"\n✅ เลือก: \033[96m{selected['name']}\033[0m")
+                    print(f"   ID: {selected['id']}")
+                    print(f"   URL: {selected['url']}\n")
+                    log.info("✅ เลือกสินค้า: %s", selected["name"])
+                    log.info("   ID: %d", selected["id"])
+                    log.info("   URL: %s", selected["url"])
+                    return selected
+                
+                poll_count += 1
+                poll_time = datetime.now().strftime("%H:%M:%S.%f")[:-3]
+                log.info("🔄 Poll #%d [%s] กำลังตรวจสอบร้าน...", poll_count, poll_time)
+                
+                current = await fetch_shop_products(shop_url, session_file, poll_browser, poll_context)
+                current_ids = {p["id"] for p in current}
+                new_ids = current_ids - baseline_ids
+                
+                log.info("   📊 สินค้าทั้งหมด: %d | ใหม่: %d", len(current_ids), len(new_ids))
 
-                # filter ตาม pattern ถ้ามี
-                if pattern:
-                    filtered = [p for p in new_products if pattern.search(p["name"])]
-                    if filtered:
-                        selected = filtered[0]
-                        log.info("✓ เลือกสินค้าที่ตรง pattern: %s", selected["name"])
-                        print(f"\033[93m✓ เลือกสินค้าที่ตรง pattern: {selected['name']}\033[0m")
+                if new_ids:
+                    new_products = [p for p in current if p["id"] in new_ids]
+                    print("\n" + "="*60)
+                    print("🆕 ตรวจพบสินค้าใหม่ %d รายการ:" % len(new_products))
+                    print("="*60)
+                    for p in new_products:
+                        print(f"\033[92m   ✨ [{p['id']}] {p['name']}\033[0m")
+                    print("="*60 + "\n")
+                    log.info("🆕 ตรวจพบสินค้าใหม่ %d รายการ:", len(new_products))
+                    for p in new_products:
+                        log.info("   • [%d] %s", p["id"], p["name"])
+
+                    # filter ตาม pattern ถ้ามี
+                    if pattern:
+                        filtered = [p for p in new_products if pattern.search(p["name"])]
+                        if filtered:
+                            selected = filtered[0]
+                            log.info("✓ เลือกสินค้าที่ตรง pattern: %s", selected["name"])
+                            print(f"\033[93m✓ เลือกสินค้าที่ตรง pattern: {selected['name']}\033[0m")
+                        else:
+                            log.warning("⚠️  สินค้าใหม่ไม่ตรงกับ pattern '%s' — เลือกตัวแรก", product_name_pattern)
+                            selected = new_products[0]
                     else:
-                        log.warning("⚠️  สินค้าใหม่ไม่ตรงกับ pattern '%s' — เลือกตัวแรก", product_name_pattern)
                         selected = new_products[0]
-                else:
-                    selected = new_products[0]
-                    log.info("✓ เลือกสินค้าแรก: %s", selected["name"])
-                    print(f"\033[93m✓ เลือกสินค้าแรก: {selected['name']}\033[0m")
+                        log.info("✓ เลือกสินค้าแรก: %s", selected["name"])
+                        print(f"\033[93m✓ เลือกสินค้าแรก: {selected['name']}\033[0m")
 
-                print("\n" + "🚀 เริ่ม checkout flow")
-                print(f"   ID: {selected['id']}")
-                print(f"   Name: \033[96m{selected['name']}\033[0m")
-                print(f"   URL: {selected['url']}\n")
-                log.info("🚀 เริ่ม checkout flow")
-                log.info("   ID: %d", selected["id"])
-                log.info("   Name: %s", selected["name"])
-                log.info("   URL: %s", selected["url"])
-                return selected
+                    print("\n" + "🚀 เริ่ม checkout flow")
+                    print(f"   ID: {selected['id']}")
+                    print(f"   Name: \033[96m{selected['name']}\033[0m")
+                    print(f"   URL: {selected['url']}\n")
+                    log.info("🚀 เริ่ม checkout flow")
+                    log.info("   ID: %d", selected["id"])
+                    log.info("   Name: %s", selected["name"])
+                    log.info("   URL: %s", selected["url"])
+                    return selected
 
-        except Exception as e:
-            log.warning("⚠️  Poll error: %s — ลองใหม่...", e)
+            except Exception as e:
+                log.warning("⚠️  Poll error: %s — ลองใหม่...", e)
 
-        await asyncio.sleep(interval_sec)
+            await asyncio.sleep(interval_sec)
+    
+    finally:
+        # ปิด browser เมื่อจบ polling
+        await poll_browser.close()
+        await pw.stop()
 
 
 async def select_product_interactive(products: list[dict]) -> dict:
