@@ -396,6 +396,77 @@ async def fetch_variants_via_http(product_url: str, product_id: int, session_fil
         log.info("✓ ดึง variants จาก HTTP+__NUXT_DATA__ ได้ %d รายการ", len(variants))
     return variants
 
+
+def extract_product_info(html: str) -> dict:
+    """ดึงข้อมูล product name, price, images จาก HTML"""
+    info = {"name": "", "price": "", "image_url": ""}
+    
+    # ดึง product name จาก title tag หรือ og:title
+    m = re.search(r'<title>([^<]+)</title>', html)
+    if m:
+        info["name"] = m.group(1).strip()
+    else:
+        m = re.search(r'<meta[^>]+property=["\']og:title["\'][^>]+content=["\']([^"\']+)["\']', html)
+        if m:
+            info["name"] = m.group(1).strip()
+    
+    # ดึง price จาก __NUXT_DATA__ (ค่าจริง)
+    m = re.search(r'<script[^>]+id=["\']__NUXT_DATA__["\'][^>]*>([\s\S]*?)</script>', html)
+    if m:
+        try:
+            data = json.loads(m.group(1).strip())
+            # ค้นหา price ใน __NUXT_DATA__ array
+            for item in data if isinstance(data, list) else []:
+                if isinstance(item, dict) and "price" in item:
+                    price_val = item.get("price")
+                    if isinstance(price_val, (int, float)):
+                        info["price"] = str(int(price_val))
+                        break
+                    elif isinstance(price_val, int) and 0 <= price_val < len(data):
+                        # dereference index
+                        actual_price = data[price_val]
+                        if isinstance(actual_price, (int, float)):
+                            info["price"] = str(int(actual_price))
+                            break
+        except Exception:
+            pass
+    
+    # ดึง image URL จาก og:image
+    m = re.search(r'<meta[^>]+property=["\']og:image["\'][^>]+content=["\']([^"\']+)["\']', html)
+    if m:
+        info["image_url"] = m.group(1).strip()
+    
+    return info
+
+
+async def fetch_product_info(product_url: str, session_file: str) -> dict:
+    """ดึงข้อมูล product ผ่าน HTTP"""
+    headers = {
+        "User-Agent": (
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+            "AppleWebKit/537.36 (KHTML, like Gecko) "
+            "Chrome/126.0.0.0 Safari/537.36"
+        ),
+        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+        "Accept-Language": "th-TH,th;q=0.9,en;q=0.8",
+    }
+    cookies: dict[str, str] = {}
+    if Path(session_file).exists():
+        cookies = cookies_from_session(session_file)
+
+    async with httpx.AsyncClient(
+        headers=headers,
+        cookies=cookies,
+        follow_redirects=True,
+        timeout=15.0,
+    ) as client:
+        resp = await client.get(product_url)
+        resp.raise_for_status()
+        html = resp.text
+
+    return extract_product_info(html)
+
+
 # ==================== CHECKOUT HELPERS ====================
 
 async def close_popup(page: Page, context: str = "") -> bool:
@@ -696,10 +767,12 @@ async def run(config: dict) -> None:
     log.info("Shop handle   : %s", shop_handle)
     log.info("Preferred sizes: %s", preferred_sizes)
 
-    # ── ขั้นที่ 1: ดึง variants ผ่าน HTTP (ไม่เปิด browser) ──
+    # ── ขั้นที่ 1: ดึง product info และ variants ผ่าน HTTP (ไม่เปิด browser) ──
     variants: list[dict] = []
+    product_info: dict = {}
     try:
         variants = await fetch_variants_via_http(product_url, product_id, session_file)
+        product_info = await fetch_product_info(product_url, session_file)
     except Exception as e:
         log.warning("HTTP fetch ล้มเหลว: %s — จะเปิด browser แทน", e)
 
@@ -739,14 +812,15 @@ async def run(config: dict) -> None:
     )
     log.info("Checkout URL: %s", checkout_url)
 
-    # ── ขั้นที่ 4: เปิด browser เฉพาะตอน navigate ไป checkout ──
+    # ── ขั้นที่ 4: เปิด browser (headless) และทำ checkout โดยอัตโนมัติ ──
     session_kwargs: dict = {}
     if Path(session_file).exists():
         session_kwargs["storage_state"] = session_file
 
+    log.info("กำลังเปิด browser (headless) และดำเนินการ checkout...")
     async with async_playwright() as pw:
         browser = await pw.chromium.launch(
-            headless=headless,
+            headless=True,  # ไม่แสดงหน้าต่าง browser
             args=[
                 "--disable-extensions",
                 "--disable-default-apps",
@@ -765,18 +839,13 @@ async def run(config: dict) -> None:
         # ── ขั้นที่ 5: เลือก PromptPay ──
         paid = await select_promptpay(page)
         if not paid:
-            log.error("❌ เลือก PromptPay ไม่สำเร็จ — เบราว์เซอร์เปิดค้างไว้")
-            try:
-                await asyncio.Event().wait()
-            except KeyboardInterrupt:
-                pass
+            log.error("❌ เลือก PromptPay ไม่สำเร็จ")
             await browser.close()
             return
 
-        # ── ขั้นที่ 6: รอ Enter แล้ว Place Order ──
-        print()
-        input(">>> กด Enter เพื่อ Place Order หรือ Ctrl+C เพื่อยกเลิก: ")
+        log.info("✅ เลือก PromptPay สำเร็จ!")
 
+        # ปิด popup ก่อน Place Order
         try:
             await page.keyboard.press("Escape")
         except Exception:
@@ -784,25 +853,158 @@ async def run(config: dict) -> None:
         await close_popup(page, "before-place-order")
         await page.wait_for_timeout(300)
 
+        # ── ขั้นที่ 6: ดึงราคาจริงจากหน้า checkout ──
+        actual_price = ""
+        try:
+            # รอให้ราคาโหลดก่อน
+            await page.wait_for_timeout(500)
+            
+            # ดึง text ทั้งหมดที่มี ฿
+            all_prices = await page.locator('text=/฿\\s*[0-9,]+/').all_text_contents()
+            log.info("ราคาทั้งหมดที่พบ: %s", all_prices)
+            
+            # หาตัวเลขที่ใหญ่ที่สุด (มักเป็นราคารวม)
+            max_price = 0
+            for price_text in all_prices:
+                import re
+                match = re.search(r'฿?\s*([0-9,]+)', price_text)
+                if match:
+                    price_val = int(match.group(1).replace(',', ''))
+                    if price_val > max_price:
+                        max_price = price_val
+            
+            if max_price > 0:
+                actual_price = str(max_price)
+                log.info("ดึงราคาจากหน้า checkout: ฿%s", actual_price)
+            else:
+                log.warning("ไม่พบราคาในหน้า checkout")
+        except Exception as e:
+            log.warning("ไม่สามารถดึงราคาจากหน้า checkout: %s", e)
+
+        # ── ขั้นที่ 7: แสดงข้อมูลและรอยืนยันก่อน Place Order ──
+        print()
+        print("=" * 60)
+        print("📦 พร้อม Place Order")
+        print("=" * 60)
+        if product_info.get("name"):
+            print(f"สินค้า: {product_info['name']}")
+        if actual_price:
+            print(f"ราคา: ฿{actual_price}")
+        elif product_info.get("price"):
+            print(f"ราคา: ฿{product_info['price']}")
+        print(f"ตัวเลือก: {matched_size}")
+        print(f"จำนวน: 1")
+        print(f"ร้านค้า: {shop_handle}")
+        print(f"วิธีชำระเงิน: PromptPay")
+        print("=" * 60)
+        print()
+
+        response = input(">>> กด Enter เพื่อ Place Order หรือ Ctrl+C เพื่อยกเลิก: ")
+
+        # ── ขั้นที่ 8: Place Order ──
         place_order_btn = page.locator(
             'button:has-text("Place Order"), button:has-text("สั่งซื้อ"), '
             '[role="button"]:has-text("Place Order"), [role="button"]:has-text("สั่งซื้อ")'
         ).first
 
         try:
+            log.info("กำลังกด Place Order...")
+            
+            # ตรวจสอบ URL ก่อนกด
+            url_before = page.url
+            log.info("URL ก่อนกด Place Order: %s", url_before)
+            
             await place_order_btn.click(timeout=5_000)
             log.info("✅ กด Place Order สำเร็จ!")
+            
+            # รอให้มีการ navigate หรือ response
+            try:
+                await page.wait_for_load_state("networkidle", timeout=10_000)
+            except Exception:
+                log.warning("Timeout รอ networkidle")
+            
+            await page.wait_for_timeout(3000)
+            
+            url_after = page.url
+            log.info("URL หลัง Place Order: %s", url_after)
+            
+            # ตรวจสอบว่า URL เปลี่ยนหรือไม่
+            if url_before == url_after:
+                log.warning("⚠️ URL ไม่เปลี่ยน - อาจไม่ได้ submit order จริง")
+                log.info("กำลังตรวจสอบ error messages...")
+                
+                # หา error messages
+                error_selectors = [
+                    'text=/error/i',
+                    'text=/ผิดพลาด/i',
+                    'text=/หมด/i',
+                    '[role="alert"]',
+                    '[class*="error"]',
+                    '[class*="Error"]',
+                ]
+                
+                found_errors = []
+                for sel in error_selectors:
+                    try:
+                        errors = await page.locator(sel).all_text_contents()
+                        if errors:
+                            found_errors.extend(errors)
+                    except Exception:
+                        pass
+                
+                if found_errors:
+                    log.error("❌ พบ error: %s", found_errors)
+                    print()
+                    print("=" * 60)
+                    print("❌ ไม่สามารถ Place Order ได้")
+                    print("=" * 60)
+                    for err in found_errors:
+                        print(f"  • {err}")
+                    print("=" * 60)
+                    print()
+                else:
+                    log.warning("ไม่พบ error message - แต่ URL ไม่เปลี่ยน")
+                
+                # ถ่าย screenshot เพื่อ debug
+                try:
+                    await page.screenshot(path="debug_place_order_failed.png")
+                    log.info("บันทึก screenshot: debug_place_order_failed.png")
+                except Exception:
+                    pass
+                
+                # ปิด browser และจบโปรแกรม
+                log.info("ปิด browser")
+                await browser.close()
+                return
+            else:
+                log.info("✅ URL เปลี่ยนแล้ว - น่าจะ submit สำเร็จ")
+                
+                # ตรวจสอบว่าไป payment page หรือ success page หรือไม่
+                if "payment" in url_after or "success" in url_after or "order" in url_after:
+                    log.info("✅ ไปหน้า payment/success/order แล้ว")
+                else:
+                    log.warning("⚠️ URL ไม่ใช่หน้า payment/success - ตรวจสอบ: %s", url_after)
+                
         except Exception as e:
             log.error("❌ กด Place Order ล้มเหลว: %s", e)
+            try:
+                await page.screenshot(path="debug_place_order_error.png")
+                log.info("บันทึก screenshot: debug_place_order_error.png")
+            except Exception:
+                pass
+                
+                # รอ QR code หรือ payment page
+                log.info("รอ QR code หรือ payment page...")
+                await page.wait_for_timeout(3000)
+                
+                try:
+                    await page.screenshot(path="debug_payment_page.png")
+                    log.info("บันทึก screenshot: debug_payment_page.png")
+                except Exception:
+                    pass
 
-        await page.wait_for_timeout(3000)
-        log.info("URL หลัง Place Order: %s", page.url)
-
-        log.info("เบราว์เซอร์เปิดค้างไว้ — กด Ctrl+C เพื่อออก")
-        try:
-            await asyncio.Event().wait()
-        except KeyboardInterrupt:
-            log.info("ออกจากโปรแกรม")
+        log.info("✅ เสร็จสิ้น - ปิด browser")
+        await browser.close()
 
         await browser.close()
 
