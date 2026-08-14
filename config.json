@@ -11,8 +11,8 @@
     "max_stock_checks": 120,
 
     "mode": "shop_monitor",
-  "shop_url": "https://shop.line.me/@mergeth",
-  "sale_start_time": "00:16:30",
+  "shop_url": "https://shop.line.me/@thelandofvava",
+  "sale_start_time": "09:59:10",
   "check_interval_ms": 500,
   "force_polling": true,
   "auto_pick_first_product": true,

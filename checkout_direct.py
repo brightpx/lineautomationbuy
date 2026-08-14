@@ -1621,6 +1621,43 @@ async def run(config: dict) -> None:
 
             url_after = page.url
 
+            # ── เช็ค Sold Out popup ก่อน (ใช้เวลาน้อย) ──
+            sold_out_selectors = [
+                "text=/sold out/i",
+                "text=/หมดแล้ว/",
+                "text=/สินค้าหมด/",
+                "text=/out of stock/i",
+                "text=/ขายหมดแล้ว/",
+                '[class*="sold-out"]',
+                '[class*="out-of-stock"]',
+                '[class*="soldout"]',
+            ]
+            found_sold_out: list[str] = []
+            for sel in sold_out_selectors:
+                try:
+                    msgs = await page.locator(sel).all_text_contents()
+                    found_sold_out.extend(m.strip() for m in msgs if m.strip())
+                except Exception:
+                    pass
+
+            if found_sold_out:
+                log.error("❌ สินค้าหมด (Sold Out): %s", found_sold_out)
+                print("\n" + "=" * 60)
+                print("❌ สินค้าหมดแล้ว (SOLD OUT)")
+                print("=" * 60)
+                for msg in found_sold_out:
+                    print(f"  • {msg}")
+                print("=" * 60 + "\n")
+                try:
+                    await page.screenshot(path="debug_sold_out.png")
+                    log.info("บันทึก screenshot: debug_sold_out.png")
+                except Exception:
+                    pass
+                # ไม่ต้อง check error อื่นแล้ว — จบที่นี่
+                log.info("✅ เสร็จสิ้น — ปิด browser")
+                await browser.close()
+                return
+
             if url_before == url_after:
                 ignore_texts = {"ดูทั้งหมด", "รวมทั้งหมด", "total", "view all", "see all"}
                 error_selectors = [
@@ -1949,6 +1986,43 @@ async def run(config: dict) -> None:
                 pass
 
             url_after = page.url
+
+            # ── เช็ค Sold Out popup ก่อน (ใช้เวลาน้อย) ──
+            sold_out_selectors = [
+                "text=/sold out/i",
+                "text=/หมดแล้ว/",
+                "text=/สินค้าหมด/",
+                "text=/out of stock/i",
+                "text=/ขายหมดแล้ว/",
+                '[class*="sold-out"]',
+                '[class*="out-of-stock"]',
+                '[class*="soldout"]',
+            ]
+            found_sold_out: list[str] = []
+            for sel in sold_out_selectors:
+                try:
+                    msgs = await page.locator(sel).all_text_contents()
+                    found_sold_out.extend(m.strip() for m in msgs if m.strip())
+                except Exception:
+                    pass
+
+            if found_sold_out:
+                log.error("❌ สินค้าหมด (Sold Out): %s", found_sold_out)
+                print("\n" + "=" * 60)
+                print("❌ สินค้าหมดแล้ว (SOLD OUT)")
+                print("=" * 60)
+                for msg in found_sold_out:
+                    print(f"  • {msg}")
+                print("=" * 60 + "\n")
+                try:
+                    await page.screenshot(path="debug_sold_out.png")
+                    log.info("บันทึก screenshot: debug_sold_out.png")
+                except Exception:
+                    pass
+                # ไม่ต้อง check error อื่นแล้ว — จบที่นี่
+                log.info("✅ เสร็จสิ้น — ปิด browser")
+                await browser.close()
+                return
 
             if url_before == url_after:
                 # URL ไม่เปลี่ยน — ตรวจหา error message
