@@ -675,6 +675,11 @@ def find_matching_variant_with_fallback(
         - ข้อความอื่น → คงเดิม ([text])
         """
         out: list[list[str]] = []
+        if prefs and not vals:
+            # สินค้าไม่มีมิติ option นี้เลย (เช่น มีแค่ option1) — ไม่ใช่ config ผิด
+            # ข้ามแบบเงียบ เพราะฟังก์ชันนี้ถูกเรียกซ้ำทุกรอบ polling
+            log.debug("ข้าม %s: สินค้านี้ไม่มีค่า option นี้", key)
+            return [[]]
         for p in prefs:
             if p.isdigit():
                 idx = int(p) - 1
@@ -2069,53 +2074,82 @@ async def poll_variant_stock(
     session_file: str,
     check_interval: int,
     max_checks: int,
-) -> bool:
+    preferred_1: Optional[list[str]] = None,
+    preferred_2: Optional[list[str]] = None,
+    fallback_enabled: bool = False,
+    max_fallback_steps: int = 0,
+) -> Optional[dict]:
     """
-    ถามสต็อกผ่าน HTTP จนกว่า variant จะกลับมามีสินค้า (available != 0)
-    - variant_id=None → คืน True ทันที (สินค้าไม่มีตัวเลือก ไม่มีแนวคิดสต็อกรายตัว)
-    - ดึง __NUXT_DATA__ ใหม่ทุกรอบ → เห็นสต็อกอัปเดตแบบ real-time
-    คืน True เมื่อมีสต็อก / False เมื่อหมดจำนวนครั้งตรวจ
+    ถามสต็อกผ่าน HTTP จนกว่าจะมีของซื้อ:
+    - ตัวเดิม (variant_id) กลับมามีสต็อก → คืน variant ตัวนั้น
+    - ถ้า fallback_enabled=True และระบุ preferred_1/preferred_2:
+      ระหว่างรอ ถ้า option อื่นในช่วงที่อนุญาต (max_fallback_steps)
+      มีสต็อก → เลื่อนไปใช้ตัวนั้นทันที (คืน variant ตัวใหม่)
+    - variant_id=None → คืน sentinel ทันที (สินค้าไม่มีตัวเลือก)
+
+    คืน dict ของ variant ที่มีสต็อก / None ถ้าหมดจำนวนครั้งตรวจ
     """
     if variant_id is None:
-        return True
+        return {"id": None, "name": "default", "option1": None,
+                "option2": None, "available": -1}
 
+    use_fb = fallback_enabled and bool(preferred_1 or preferred_2)
     log.info(
-        "🔄 โหมดรอเติมสต็อก: ถามทุก %d วินาที สูงสุด %d ครั้ง (Ctrl+C เพื่อยกเลิก)",
+        "🔄 โหมดรอเติมสต็อก: ถามทุก %d วินาที สูงสุด %d ครั้ง%s (Ctrl+C เพื่อยกเลิก)",
         check_interval, max_checks,
+        " + เลื่อน option อัตโนมัติถ้าตัวอื่นมีของ" if use_fb else "",
     )
 
     for attempt in range(1, max_checks + 1):
         try:
             variants = await fetch_variants_via_http(product_url, product_id, session_file)
+
+            # ── 1) ตัวเดิมกลับมามีสต็อกหรือยัง (priority สูงสุด) ──
             target = next((v for v in variants if v.get("id") == variant_id), None)
-            if target is None:
-                if variants:
-                    # variant หายจากรายการ = ยังไม่เปิดขาย/ยังไม่เติม
-                    log.info("⏳ ยังไม่พบ variant ID %s (รอบ %d/%d)",
-                             variant_id, attempt, max_checks)
-                else:
-                    log.warning("⚠️  ดึง variants ไม่ได้ (รอบ %d/%d)", attempt, max_checks)
-            else:
+            if target is not None and target.get("available", -1) != 0:
                 stock = target.get("available", -1)
-                if stock != 0:
+                log.info(
+                    "✅ สต็อกกลับมาแล้ว! '%s' available=%s (รอบ %d/%d)",
+                    target.get("name"),
+                    "ไม่ทราบ" if stock == -1 else stock,
+                    attempt, max_checks,
+                )
+                return target
+
+            # ── 2) fallback: ลองเลื่อนไป option อื่นที่มีสต็อก ──
+            if use_fb:
+                cand = find_matching_variant_with_fallback(
+                    variants, preferred_1, preferred_2,
+                    fallback_enabled=True,
+                    max_fallback_steps=max_fallback_steps,
+                )
+                if (
+                    cand
+                    and cand.get("id") != variant_id
+                    and cand.get("available", -1) != 0
+                ):
+                    cstock = cand.get("available", -1)
                     log.info(
-                        "✅ สต็อกกลับมาแล้ว! '%s' available=%s (รอบ %d/%d)",
-                        target.get("name"),
-                        "ไม่ทราบ" if stock == -1 else stock,
+                        "🔀 เลื่อน option อัตโนมัติ: ID %s → '%s' (ID %s) สต็อก %s (รอบ %d/%d)",
+                        variant_id, cand.get("name"), cand.get("id"),
+                        "ไม่ทราบ" if cstock == -1 else cstock,
                         attempt, max_checks,
                     )
-                    return True
-                # log บางรอบ ไม่ต้องทุกรอบ กัน terminal ล้น
-                if attempt == 1 or attempt % 10 == 0:
-                    log.info("⏳ '%s' ยังหมดสต็อก (รอบ %d/%d) — รอ %d วิ...",
-                             target.get("name"), attempt, max_checks, check_interval)
+                    return cand
+
+            # log บางรอบ ไม่ต้องทุกรอบ กัน terminal ล้น
+            if attempt == 1 or attempt % 10 == 0:
+                name = target.get("name") if target else f"ID {variant_id}"
+                extra = " (ไม่มี option ใดในช่วง fallback มีของ)" if use_fb else ""
+                log.info("⏳ '%s' ยังหมดสต็อก%s (รอบ %d/%d) — รอ %d วิ...",
+                         name, extra, attempt, max_checks, check_interval)
         except Exception as e:
             log.warning("⚠️  ตรวจสต็อกล้มเหลว (รอบ %d/%d): %s", attempt, max_checks, e)
 
         await asyncio.sleep(check_interval)
 
     log.error("❌ รอเติมสต็อกครบ %d ครั้งแล้วยังหมด — ยกเลิก", max_checks)
-    return False
+    return None
 
 
 async def place_order_with_restock_retry(
@@ -2135,6 +2169,10 @@ async def place_order_with_restock_retry(
     check_interval: int,
     max_stock_checks: int,
     restock_wait_enabled: bool = True,
+    preferred_1: Optional[list[str]] = None,
+    preferred_2: Optional[list[str]] = None,
+    fallback_enabled: bool = False,
+    max_fallback_steps: int = 0,
 ) -> str:
     """
     วงจรสั่งซื้อพร้อมรอเติมสต็อก:
@@ -2144,6 +2182,10 @@ async def place_order_with_restock_retry(
       └─ sold_out → ถามสต็อกทาง HTTP จนเติม → เติมตะกร้า+mark ใหม่ผ่าน API
                     → เปิด checkout ใหม่บน page เดิม → เลือก PromptPay → วนซ้ำ
                     (ปิดได้ด้วย restock_wait_enabled=False → คืน PO_SOLD_OUT ทันที)
+
+    ถ้า fallback_enabled=True: ระหว่างรอเติมสต็อก ถ้า option อื่นในช่วง
+    max_fallback_steps มีของ → เลื่อนไป checkout ตัวใหม่ทันที (variant_id/label
+    เปลี่ยนถาวรสำหรับรอบถัดๆ ไป)
     """
     while True:
         await confirm_place_order(auto_confirm)
@@ -2158,11 +2200,23 @@ async def place_order_with_restock_retry(
         print("\n🔁 สินค้าหมด — สลับไปโหมดรอเติมสต็อกอัตโนมัติ\n")
 
         # ── 1) รอสต็อกกลับมา (HTTP polling ไม่ใช้ browser) ──
-        if not await poll_variant_stock(
+        #    ถ้าเปิด fallback ไว้ อาจได้ variant ตัวใหม่ (เลื่อน option) แทน
+        ready_variant = await poll_variant_stock(
             product_url, product_id, variant_id,
             session_file, check_interval, max_stock_checks,
-        ):
+            preferred_1=preferred_1,
+            preferred_2=preferred_2,
+            fallback_enabled=fallback_enabled,
+            max_fallback_steps=max_fallback_steps,
+        )
+        if ready_variant is None:
             return PO_GAVE_UP
+
+        if ready_variant.get("id") != variant_id:
+            log.info("🔀 เปลี่ยนเป้าหมาย: '%s' (ID %s)",
+                     ready_variant.get("name"), ready_variant.get("id"))
+            variant_id = ready_variant.get("id")
+            variant_label = ready_variant.get("name", str(variant_id))
 
         # ── 2) เติมลงตะกร้า + mark checkout ใหม่ ──
         checkout_url: Optional[str] = None
@@ -2397,6 +2451,10 @@ async def run(config: dict) -> None:
                 "restock_wait_max_checks", max_stock_checks,
             )),
             restock_wait_enabled=bool(config.get("restock_wait_enabled", True)),
+            preferred_1=config.get("preferred_1"),
+            preferred_2=config.get("preferred_2"),
+            fallback_enabled=bool(config.get("fallback_enabled", True)),
+            max_fallback_steps=int(config.get("max_fallback_steps", 0)),
         )
         if final_status == PO_PLACED:
             log.info("✅ เสร็จสิ้น — ปิด browser")
@@ -2630,6 +2688,10 @@ async def run(config: dict) -> None:
                 "restock_wait_max_checks", max_stock_checks,
             )),
             restock_wait_enabled=bool(config.get("restock_wait_enabled", True)),
+            preferred_1=preferred_1,
+            preferred_2=preferred_2,
+            fallback_enabled=fallback_enabled,
+            max_fallback_steps=max_fallback_steps,
         )
         if final_status == PO_PLACED:
             log.info("✅ เสร็จสิ้น — ปิด browser")
