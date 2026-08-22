@@ -624,11 +624,18 @@ def find_matching_variant_with_fallback(
     variants: list[dict],
     preferred_1: Optional[list[str]] = None,
     preferred_2: Optional[list[str]] = None,
+    fallback_enabled: bool = True,
+    max_fallback_steps: int = 0,
 ) -> Optional[dict]:
     """
     เหมือน find_matching_variant แต่เลื่อนลำดับอัตโนมัติเมื่อหมดสต็อก:
       preferred_1: ["1"] หมด → ลองตำแหน่ง 2, 3, 4, ... ของ option1 ไปเรื่อยๆ
       preferred_2: ["1"] หมด → ลองตำแหน่ง 2, 3, 4, ... ของ option2 ไปเรื่อยๆ
+
+    Config ควบคุม:
+      fallback_enabled=False → ไม่เลื่อนตำแหน่งเลย (ใช้เฉพาะตำแหน่งที่ระบุ)
+      max_fallback_steps=N   → เลื่อนได้สูงสุด N ตำแหน่งจากที่ระบุ
+                               (0 = ไม่จำกัด, เลื่อนถึงตัวท้าย)
 
     ลำดับการลอง (ตัวอย่าง pref1="1", pref2="1"):
       (pos1, pos1) → (pos2, pos1) → (pos3, pos1) → ...   ← ไล่ pref1 ก่อน
@@ -663,7 +670,8 @@ def find_matching_variant_with_fallback(
     def _expand(prefs: list[str], vals: list[str], key: str) -> list[list[str]]:
         """
         ขยาย prefs เป็นรายการ candidate (แต่ละตัวเป็น list ของชื่อ option):
-        - ตัวเลข k → ไล่ทุกตำแหน่งตั้งแต่ k ถึงตัวท้าย ([v_k], [v_k+1], ...)
+        - ตัวเลข k → ไล่ตำแหน่ง k ถึง k+max_fallback_steps
+          (max_fallback_steps=0 → ไล่ถึงตัวท้าย; fallback_enabled=False → เฉพาะ k)
         - ข้อความอื่น → คงเดิม ([text])
         """
         out: list[list[str]] = []
@@ -671,7 +679,13 @@ def find_matching_variant_with_fallback(
             if p.isdigit():
                 idx = int(p) - 1
                 if 0 <= idx < len(vals):
-                    out.extend([v] for v in vals[idx:])
+                    if not fallback_enabled:
+                        out.append([vals[idx]])
+                    elif max_fallback_steps > 0:
+                        end = min(len(vals), idx + 1 + max_fallback_steps)
+                        out.extend([v] for v in vals[idx:end])
+                    else:
+                        out.extend([v] for v in vals[idx:])
                 else:
                     log.warning(
                         "⚠️  ตำแหน่ง '%s' เกินจำนวน option ของ %s (มี %d ค่า)",
@@ -685,6 +699,7 @@ def find_matching_variant_with_fallback(
     cands2 = _expand(raw2, vals2, "option2")
 
     seen_ids: set = set()
+    first_match: Optional[dict] = None
 
     # ผ่านที่ 1: หาตัวแรกที่ match และมีสต็อก ตามลำดับความสำคัญ
     for c1 in cands1:
@@ -693,11 +708,14 @@ def find_matching_variant_with_fallback(
             if v is None or v.get("id") in seen_ids:
                 continue
             seen_ids.add(v.get("id"))
+            if first_match is None:
+                first_match = v
             if v.get("available", -1) != 0:
                 return v
 
     # ผ่านที่ 2: ทุกตัวหมดสต็อก → คืนตัวแรกที่ match (ให้ caller รอสต็อก)
-    return find_matching_variant(variants, raw1, raw2)
+    # (ห้าม re-match ด้วย raw prefs เพราะตัวเลข = ตำแหน่ง ไม่ใช่ชื่อ option)
+    return first_match
 
 
 async def get_variants_from_page(page: Page, product_id: int) -> list[dict]:
@@ -779,6 +797,225 @@ def cookies_from_session(session_file: str) -> dict[str, str]:
     """แปลง Playwright storage_state cookies → dict สำหรับ httpx"""
     data = json.loads(Path(session_file).read_text(encoding="utf-8"))
     return {c["name"]: c["value"] for c in data.get("cookies", [])}
+
+
+# ==================== CART API (API-FIRST CHECKOUT) ====================
+# Reverse-engineered จาก LINE Shopping frontend (chunk euAnLIQR.js / BmBpQeLW.js):
+#   PUT  /api/v1/cart/product          {productId, productVariantId, quantity}      → เพิ่มลงตะกร้า
+#   PUT  /api/v1/cart/product/adjust   {productId, productVariantId,
+#                                       previousQuantity, quantity}                → ตั้งจำนวนให้ตรง spec
+#   GET  /api/v2/cart                  → carts[] {cartId, searchId, items[{...,
+#                                       productSnapshotId}]}
+#   PUT  /api/v2/cart/{cartId}/checkout {clearErrorCoupon, products:[
+#                                       {productSnapshotId, isPromotion}],
+#                                       promotionId}                               → mark ว่าจะ checkout item ไหน
+# จากนั้นเปิด https://shop.line.me/@{handle}/checkout/cart?id={cartId}
+# → หน้า checkout แสดง "เฉพาะ item ที่ mark" (ไม่รวมของอื่นในตะกร้า) พร้อมปุ่ม Place Order
+# Auth: Authorization: Bearer <LIFF accessToken> (จาก localStorage ใน session file)
+
+CART_API_BASE = "https://customer-api.line-apps.com/cart"
+
+_HTTP_UA = (
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+    "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36"
+)
+
+
+def liff_token_from_session(session_file: str) -> str:
+    """ดึง LIFF access token จาก localStorage ใน storage_state file (strip quotes)"""
+    try:
+        data = json.loads(Path(session_file).read_text(encoding="utf-8"))
+    except Exception as e:
+        log.warning("อ่าน session file ไม่ได้ (%s): %s", session_file, e)
+        return ""
+    for origin in data.get("origins", []):
+        if "shop.line.me" not in origin.get("origin", ""):
+            continue
+        for kv in origin.get("localStorage", []):
+            if str(kv.get("name", "")).endswith(":accessToken"):
+                return str(kv.get("value") or "").strip('"')
+    return ""
+
+
+def _cart_api_headers(token: str) -> dict[str, str]:
+    return {
+        "User-Agent": _HTTP_UA,
+        "Accept": "application/json",
+        "Content-Type": "application/json",
+        "Authorization": f"Bearer {token}",
+        "Origin": "https://shop.line.me",
+        "Referer": "https://shop.line.me/",
+    }
+
+
+async def _find_cart_item(
+    client: httpx.AsyncClient,
+    shop_search_id: str,
+    product_id: int,
+    variant_id: Optional[int],
+) -> tuple[Optional[str], Optional[int], int]:
+    """
+    หา item ของสินค้าเป้าหมายในตะกร้า
+    Returns (cartId, productSnapshotId, currentQuantity) — ไม่เจอ → (None, None, 0)
+    """
+    resp = await client.get(f"{CART_API_BASE}/api/v2/cart")
+    resp.raise_for_status()
+    for cart in resp.json().get("data", []):
+        if cart.get("searchId") != shop_search_id:
+            continue
+        for item in cart.get("items", []):
+            if item.get("productId") != product_id:
+                continue
+            if variant_id is not None and item.get("productVariantId") != variant_id:
+                continue
+            snapshot = item.get("productSnapshotId")
+            if snapshot is None:
+                continue
+            return cart.get("cartId"), int(snapshot), int(item.get("quantity") or 0)
+    return None, None, 0
+
+
+async def api_add_to_cart(
+    product_id: int,
+    variant_id: Optional[int],
+    quantity: int,
+    session_file: str,
+    shop_search_id: str,
+) -> bool:
+    """
+    เพิ่มสินค้าลงตะกร้าผ่าน API (ไม่เปิด browser)
+    - ถ้ายังไม่มีในตะกร้า → PUT /api/v1/cart/product
+    - ถ้ามีอยู่แล้วแต่จำนวนไม่ตรง → PUT /api/v1/cart/product/adjust (ตั้งให้ตรง spec)
+    - ถ้ามีอยู่แล้วและจำนวนตรง → ข้าม (ถือว่าสำเร็จ)
+    """
+    token = liff_token_from_session(session_file)
+    if not token:
+        log.warning("⚠️  ไม่พบ LIFF access token ใน %s", session_file)
+        return False
+
+    pid = int(product_id)
+    vid = int(variant_id) if variant_id is not None else None
+    qty = max(1, int(quantity))
+
+    async with httpx.AsyncClient(
+        headers=_cart_api_headers(token),
+        cookies=cookies_from_session(session_file),
+        follow_redirects=True,
+        timeout=15.0,
+    ) as client:
+        cart_id, _snapshot, current_qty = await _find_cart_item(
+            client, shop_search_id, pid, vid
+        )
+
+        if cart_id and current_qty == qty:
+            log.info("✓ มีสินค้านี้ในตะกร้าอยู่แล้ว x%d — จำนวนตรง ข้ามการเพิ่ม", current_qty)
+            return True
+
+        if cart_id and current_qty > 0:
+            resp = await client.put(
+                f"{CART_API_BASE}/api/v1/cart/product/adjust",
+                json={
+                    "productId": pid,
+                    "productVariantId": vid,
+                    "previousQuantity": current_qty,
+                    "quantity": qty,
+                },
+            )
+            action = f"adjust x{current_qty} → x{qty}"
+        else:
+            resp = await client.put(
+                f"{CART_API_BASE}/api/v1/cart/product",
+                json={"productId": pid, "productVariantId": vid, "quantity": qty},
+            )
+            action = f"add x{qty}"
+
+        if resp.status_code == 200:
+            try:
+                ok = bool(resp.json().get("success"))
+            except Exception:
+                ok = False
+            if ok:
+                log.info("🛒 เพิ่มลงตะกร้าผ่าน API สำเร็จ (%s)", action)
+                return True
+
+        log.warning(
+            "⚠️  add-to-cart API ล้มเหลว (%s): HTTP %d %s",
+            action, resp.status_code, resp.text[:200],
+        )
+        return False
+
+
+async def api_mark_checkout_and_build_url(
+    session_file: str,
+    shop_search_id: str,
+    product_id: int,
+    variant_id: Optional[int],
+) -> Optional[str]:
+    """
+    Mark ว่าจะ checkout เฉพาะ item เป้าหมาย (PUT /api/v2/cart/{cartId}/checkout)
+    แล้วคืน URL หน้า checkout แบบ ?id={cartId}
+    หน้านี้จะแสดงเฉพาะ item ที่ mark — ไม่รวมสินค้าอื่นที่ค้างในตะกร้า
+    Returns None ถ้าล้มเหลว
+    """
+    token = liff_token_from_session(session_file)
+    if not token:
+        return None
+
+    async with httpx.AsyncClient(
+        headers=_cart_api_headers(token),
+        cookies=cookies_from_session(session_file),
+        follow_redirects=True,
+        timeout=15.0,
+    ) as client:
+        cart_id, snapshot, _qty = await _find_cart_item(
+            client, shop_search_id, int(product_id), variant_id
+        )
+        if not cart_id or snapshot is None:
+            log.warning("⚠️  ไม่พบ item ในตะกร้าสำหรับ mark checkout")
+            return None
+
+        resp = await client.put(
+            f"{CART_API_BASE}/api/v2/cart/{cart_id}/checkout",
+            json={
+                "clearErrorCoupon": False,
+                "products": [{"productSnapshotId": snapshot, "isPromotion": False}],
+                "promotionId": None,
+            },
+        )
+        if resp.status_code != 200:
+            log.warning(
+                "⚠️  PUT cart/{{cartId}}/checkout ล้มเหลว: HTTP %d %s",
+                resp.status_code, resp.text[:200],
+            )
+            return None
+
+    return f"https://shop.line.me/{shop_search_id}/checkout/cart?id={cart_id}"
+
+
+async def build_checkout_url_via_api(
+    shop_handle: str,
+    product_id: int,
+    variant_id: Optional[int],
+    quantity: int,
+    session_file: str,
+) -> Optional[str]:
+    """
+    API-first: เพิ่มลงตะกร้า + mark checkout ผ่าน API ทั้งหมด (ไม่แตะ browser)
+    คืน checkout URL (?id=cartId) หรือ None ถ้าล้มเหลว
+    (caller ควร fallback ไปใช้ ?data= URL เมื่อได้ None)
+    """
+    handle = shop_handle if shop_handle.startswith("@") else f"@{shop_handle}"
+    try:
+        if not await api_add_to_cart(
+            product_id, variant_id, quantity, session_file, handle
+        ):
+            return None
+        return await api_mark_checkout_and_build_url(
+            session_file, handle, product_id, variant_id
+        )
+    except Exception as e:
+        log.warning("⚠️  API-first checkout ล้มเหลว: %s", e)
+        return None
 
 
 async def fetch_variants_via_http(product_url: str, product_id: int, session_file: str) -> list[dict]:
@@ -1263,31 +1500,66 @@ async def select_product_interactive(products: list[dict]) -> dict:
 
 # ==================== CHECKOUT HELPERS ====================
 
+_POPUP_CLOSE_JS = """
+() => {
+    const isVisible = (el) => {
+        if (!el) return false;
+        const r = el.getBoundingClientRect();
+        if (r.width <= 0 || r.height <= 0) return false;
+        const s = window.getComputedStyle(el);
+        return s.visibility !== 'hidden' && s.display !== 'none';
+    };
+    // คลิกเฉพาะปุ่มปิดที่อยู่ "ใน" modal/dialog/overlay ที่ visible เท่านั้น
+    // (selector แบบ global อย่าง button[class*=close] จะ match ของแปลกและไม่มีวันหาย)
+    const containers = [
+        ...document.querySelectorAll(
+            '[class*="modal"], [class*="dialog"], [class*="overlay"], '
+            + '[class*="backdrop"], [role="dialog"]'
+        ),
+    ].filter(isVisible);
+    const closeTexts = ['got it', 'รับทราบ', 'ตกลง', 'ok', 'close', 'ปิด', 'ยืนยัน', 'confirm'];
+    const clicked = [];
+    for (const c of containers) {
+        for (const btn of c.querySelectorAll('button, [role="button"]')) {
+            if (!isVisible(btn)) continue;
+            const label = ((btn.getAttribute('aria-label') || '') + ' '
+                + (btn.textContent || '').trim()).toLowerCase();
+            const looksClose = /[×✕]|\\bclose\\b/.test(label)
+                || closeTexts.some(t => label === t);
+            if (looksClose) {
+                btn.click();
+                clicked.push(label.slice(0, 20));
+                break;  // ปุ่มเดียวต่อ container พอ
+            }
+        }
+    }
+    return clicked;
+}
+"""
+
+
 async def close_popup(page: Page, context: str = "") -> bool:
-    """ปิด popup/modal ที่อาจขวาง"""
+    """
+    ปิด popup/modal ที่อาจขวาง (เวอร์ชันเร็ว — JS evaluate ครั้งเดียว)
+    Returns True ถ้าคลิกปิดได้อย่างน้อย 1 ปุ่ม
+    """
     try:
         await page.keyboard.press("Escape")
-        await page.wait_for_load_state("domcontentloaded", timeout=500)
     except Exception:
         pass
 
-    combined_selector = (
-        "button:has-text('×'), button:has-text('X'), button:has-text('Close'), "
-        "button:has-text('ปิด'), button:has-text('Got it'), button:has-text('รับทราบ'), "
-        "button:has-text('ไม่ใช้'), [data-testid*='close'], [aria-label*='close' i], "
-        "button[class*='close' i]"
-    )
-    for _ in range(2):
+    try:
+        clicked = await page.evaluate(_POPUP_CLOSE_JS)
+    except Exception:
+        clicked = []
+
+    if clicked:
+        log.info("  พบ popup (%s) — ปิด: %s", context, clicked)
         try:
-            btn = page.locator(combined_selector).first
-            if await btn.is_visible(timeout=500):
-                log.info("  พบ popup (%s) — ปิด...", context)
-                await btn.click(timeout=2000, force=True)
-                await page.wait_for_load_state("domcontentloaded", timeout=500)
-                log.info("  ✓ ปิด popup สำเร็จ")
-                return True
+            await page.wait_for_timeout(120)
         except Exception:
             pass
+        return True
     return False
 
 
@@ -1305,33 +1577,32 @@ async def select_promptpay(page: Page) -> bool:
         if "/checkout/cart" in page.url:
             log.info("URL มี /checkout/cart — ตรวจสอบว่าต้องกด Checkout หรือไม่...")
 
-            # รอ Vue render เริ่มต้น
-            try:
-                await page.wait_for_load_state("networkidle", timeout=10_000)
-            except PWTimeout:
-                pass
-
-            # dump ปุ่มทั้งหมดที่เห็น เพื่อ debug
-            btn_texts = await page.evaluate("""
-                () => [...document.querySelectorAll('button,[role="button"]')]
-                    .filter(b => b.offsetParent !== null)
-                    .map(b => b.textContent.trim().slice(0, 40))
-                    .filter(t => t.length > 0)
-            """)
-            log.info("ปุ่มที่เห็นบนหน้า: %s", btn_texts)
-
-            # ถ้า PromptPay หรือ payment section โหลดแล้ว → ข้าม Step A
-            pp_visible = await page.evaluate("""
-                () => {
-                    const walker = document.createTreeWalker(
-                        document.body, NodeFilter.SHOW_TEXT, null);
-                    while (walker.nextNode()) {
-                        if (walker.currentNode.textContent.trim().toLowerCase() === 'promptpay')
-                            return true;
+            def _pp_visible_js() -> str:
+                return """
+                    () => {
+                        const walker = document.createTreeWalker(
+                            document.body, NodeFilter.SHOW_TEXT, null);
+                        while (walker.nextNode()) {
+                            if (walker.currentNode.textContent.trim().toLowerCase() === 'promptpay')
+                                return true;
+                        }
+                        return false;
                     }
-                    return false;
-                }
-            """)
+                """
+
+            # เช็คก่อนทันที (URL ?id={cartId} มัก render PromptPay เร็ว)
+            # → ถ้าเห็นแล้วข้าม networkidle ได้เลย ประหยัดหลายวินาที
+            pp_visible = await page.evaluate(_pp_visible_js())
+
+            if not pp_visible:
+                # ยังไม่เห็น → poll รอเฉพาะ text PromptPay (เร็วกว่า networkidle
+                # เพราะไม่ต้องรอ request อื่นๆ ให้ quiet)
+                try:
+                    await page.wait_for_function(_pp_visible_js(), timeout=10_000)
+                    pp_visible = True
+                except PWTimeout:
+                    pass
+
             if pp_visible:
                 log.info("✓ PromptPay ปรากฏแล้ว — ข้าม Step A")
             else:
@@ -1396,15 +1667,16 @@ async def select_promptpay(page: Page) -> bool:
             pass
 
         # ── Step C: ปิด popup/overlay ก่อน แล้วเลือก PromptPay ──
-        # กด Escape + ปิดปุ่มปิดทุกแบบ
+        # ปิดสูงสุด 3 รอบ แต่ถ้าไม่มีอะไรให้ปิด → จบทันที (ไม่เสียเวลา)
         for _ in range(3):
-            await close_popup(page, "before-promptpay")
+            if not await close_popup(page, "before-promptpay"):
+                break
 
         # ปิด overlay โดยตรงผ่าน JS (บาง popup ไม่มีปุ่มปิด)
+        # ⚠️ ไม่คลิกปุ่มใดๆ — แค่ซ่อน overlay เพื่อไม่บังการคลิก PromptPay
         dismissed = await page.evaluate("""
             () => {
                 const dismissed = [];
-                // ซ่อน modal backdrop / overlay
                 document.querySelectorAll(
                     '[class*="modal"],[class*="overlay"],[class*="backdrop"],[class*="dialog"]'
                 ).forEach(el => {
@@ -1412,15 +1684,6 @@ async def select_promptpay(page: Page) -> bool:
                     if (s.position === 'fixed' || s.position === 'absolute') {
                         el.style.display = 'none';
                         dismissed.push(el.className.slice(0,40));
-                    }
-                });
-                // คลิกปุ่ม Got it / T&C / รับทราบ
-                const closeTexts = ['got it','รับทราบ','ตกลง','ok','close','ปิด','ยืนยัน','confirm'];
-                document.querySelectorAll('button,[role="button"]').forEach(btn => {
-                    const t = btn.textContent.trim().toLowerCase();
-                    if (closeTexts.some(c => t === c || t.includes(c))) {
-                        btn.click();
-                        dismissed.push('btn:' + btn.textContent.trim().slice(0,20));
                     }
                 });
                 return dismissed;
@@ -1712,13 +1975,19 @@ async def _collect_visible_texts(page: Page, selectors: list[str], ignore: set |
     return found
 
 
-async def click_place_order_and_verify(page: Page) -> bool:
+# ค่าคืนจาก click_place_order_and_verify
+PO_PLACED = "placed"        # สั่งซื้อสำเร็จ (URL เปลี่ยนไปหน้า payment/success)
+PO_SOLD_OUT = "sold_out"    # popup สินค้าหมด → ควรรอเติมสต็อกแล้วลองใหม่
+PO_ERROR = "error"          # error อื่นๆ (กดไม่ได้ / error message)
+
+
+async def click_place_order_and_verify(page: Page) -> str:
     """
     กด Place Order และตรวจผลลัพธ์:
-    - Sold Out popup → แสดงผล + screenshot → return True (จบเฉยๆ)
-    - URL ไม่เปลี่ยน → หา error message + screenshot
-    - URL เปลี่ยน → ตรวจว่าเป็นหน้า payment/success/order + screenshot
-    Returns False เฉพาะเมื่อกดปุ่มล้มเหลว (exception)
+    - Sold Out popup → แสดงผล + screenshot → PO_SOLD_OUT (caller รอเติมสต็อก)
+    - URL ไม่เปลี่ยน → หา error message + screenshot → PO_ERROR
+    - URL เปลี่ยน → ตรวจว่าเป็นหน้า payment/success/order + screenshot → PO_PLACED
+    Returns PO_ERROR เฉพาะเมื่อกดปุ่มล้มเหลว (exception)
     """
     place_order_btn = page.locator(PLACE_ORDER_SELECTOR).first
 
@@ -1746,7 +2015,7 @@ async def click_place_order_and_verify(page: Page) -> bool:
             print("=" * 60 + "\n")
             await save_debug_screenshot(page, "debug_sold_out.png")
             # ไม่ต้อง check error อื่นแล้ว — จบที่นี่
-            return True
+            return PO_SOLD_OUT
 
         if url_before == url_after:
             # URL ไม่เปลี่ยน — ตรวจหา error message
@@ -1764,6 +2033,7 @@ async def click_place_order_and_verify(page: Page) -> bool:
                 log.warning("⚠️  URL ไม่เปลี่ยน และไม่พบ error message")
 
             await save_debug_screenshot(page, "debug_place_order_failed.png")
+            return PO_ERROR
 
         else:
             log.info("✅ URL เปลี่ยน → %s", url_after)
@@ -1781,12 +2051,156 @@ async def click_place_order_and_verify(page: Page) -> bool:
 
             await save_debug_screenshot(page, "debug_payment_page.png")
 
-        return True
+        return PO_PLACED
 
     except Exception as place_err:
         log.error("❌ กด Place Order ล้มเหลว: %s", place_err)
         await save_debug_screenshot(page, "debug_place_order_error.png")
-        return False
+        return PO_ERROR
+
+
+PO_GAVE_UP = "gave_up"      # รอเติมสต็อกครบจำนวนครั้งแล้วยังหมด
+
+
+async def poll_variant_stock(
+    product_url: str,
+    product_id: int,
+    variant_id: Optional[int],
+    session_file: str,
+    check_interval: int,
+    max_checks: int,
+) -> bool:
+    """
+    ถามสต็อกผ่าน HTTP จนกว่า variant จะกลับมามีสินค้า (available != 0)
+    - variant_id=None → คืน True ทันที (สินค้าไม่มีตัวเลือก ไม่มีแนวคิดสต็อกรายตัว)
+    - ดึง __NUXT_DATA__ ใหม่ทุกรอบ → เห็นสต็อกอัปเดตแบบ real-time
+    คืน True เมื่อมีสต็อก / False เมื่อหมดจำนวนครั้งตรวจ
+    """
+    if variant_id is None:
+        return True
+
+    log.info(
+        "🔄 โหมดรอเติมสต็อก: ถามทุก %d วินาที สูงสุด %d ครั้ง (Ctrl+C เพื่อยกเลิก)",
+        check_interval, max_checks,
+    )
+
+    for attempt in range(1, max_checks + 1):
+        try:
+            variants = await fetch_variants_via_http(product_url, product_id, session_file)
+            target = next((v for v in variants if v.get("id") == variant_id), None)
+            if target is None:
+                if variants:
+                    # variant หายจากรายการ = ยังไม่เปิดขาย/ยังไม่เติม
+                    log.info("⏳ ยังไม่พบ variant ID %s (รอบ %d/%d)",
+                             variant_id, attempt, max_checks)
+                else:
+                    log.warning("⚠️  ดึง variants ไม่ได้ (รอบ %d/%d)", attempt, max_checks)
+            else:
+                stock = target.get("available", -1)
+                if stock != 0:
+                    log.info(
+                        "✅ สต็อกกลับมาแล้ว! '%s' available=%s (รอบ %d/%d)",
+                        target.get("name"),
+                        "ไม่ทราบ" if stock == -1 else stock,
+                        attempt, max_checks,
+                    )
+                    return True
+                # log บางรอบ ไม่ต้องทุกรอบ กัน terminal ล้น
+                if attempt == 1 or attempt % 10 == 0:
+                    log.info("⏳ '%s' ยังหมดสต็อก (รอบ %d/%d) — รอ %d วิ...",
+                             target.get("name"), attempt, max_checks, check_interval)
+        except Exception as e:
+            log.warning("⚠️  ตรวจสต็อกล้มเหลว (รอบ %d/%d): %s", attempt, max_checks, e)
+
+        await asyncio.sleep(check_interval)
+
+    log.error("❌ รอเติมสต็อกครบ %d ครั้งแล้วยังหมด — ยกเลิก", max_checks)
+    return False
+
+
+async def place_order_with_restock_retry(
+    page: Page,
+    *,
+    auto_confirm: bool,
+    product_url: str,
+    product_id: int,
+    product_name: str,
+    shop_handle: str,
+    variant_id: Optional[int],
+    variant_label: str,
+    quantity: int,
+    session_file: str,
+    encoding_mode: str,
+    use_api_first: bool,
+    check_interval: int,
+    max_stock_checks: int,
+    restock_wait_enabled: bool = True,
+) -> str:
+    """
+    วงจรสั่งซื้อพร้อมรอเติมสต็อก:
+      confirm → กด Place Order → ตรวจผล
+      ├─ placed   → จบ (คืน PO_PLACED)
+      ├─ error    → คืน PO_ERROR (ไม่ retry — error อื่นอาจไม่ใช่เรื่องสต็อก)
+      └─ sold_out → ถามสต็อกทาง HTTP จนเติม → เติมตะกร้า+mark ใหม่ผ่าน API
+                    → เปิด checkout ใหม่บน page เดิม → เลือก PromptPay → วนซ้ำ
+                    (ปิดได้ด้วย restock_wait_enabled=False → คืน PO_SOLD_OUT ทันที)
+    """
+    while True:
+        await confirm_place_order(auto_confirm)
+        result = await click_place_order_and_verify(page)
+
+        if result != PO_SOLD_OUT:
+            return result
+        if not restock_wait_enabled:
+            log.warning("⚠️  restock_wait_enabled=false — จบการทำงาน (sold-out)")
+            return PO_SOLD_OUT
+
+        print("\n🔁 สินค้าหมด — สลับไปโหมดรอเติมสต็อกอัตโนมัติ\n")
+
+        # ── 1) รอสต็อกกลับมา (HTTP polling ไม่ใช้ browser) ──
+        if not await poll_variant_stock(
+            product_url, product_id, variant_id,
+            session_file, check_interval, max_stock_checks,
+        ):
+            return PO_GAVE_UP
+
+        # ── 2) เติมลงตะกร้า + mark checkout ใหม่ ──
+        checkout_url: Optional[str] = None
+        if use_api_first:
+            log.info("🚀 เติมลงตะกร้าผ่าน API อีกครั้ง...")
+            checkout_url = await build_checkout_url_via_api(
+                shop_handle=shop_handle,
+                product_id=product_id,
+                variant_id=variant_id,
+                quantity=quantity,
+                session_file=session_file,
+            )
+        if not checkout_url:
+            checkout_url = build_checkout_url(
+                shop_handle=shop_handle,
+                product_id=product_id,
+                variant_id=variant_id,
+                quantity=quantity,
+                encoding_mode=encoding_mode,
+            )
+            log.info("🔗 Checkout URL (?data=): %s", checkout_url)
+
+        # ── 3) เปิด checkout ใหม่บน page/tab เดิม (session ยังอยู่) ──
+        log.info("🌐 เปิด checkout ใหม่...")
+        if not await finalize_checkout(page, checkout_url):
+            log.error("❌ เตรียม checkout รอบใหม่ไม่สำเร็จ")
+            return PO_ERROR
+
+        # ── 4) แสดงสรุปใหม่ (ราคาอาจเปลี่ยน) แล้ววนกลับไป confirm+กด ──
+        actual_price = await extract_price_from_page(page)
+        print_order_summary(
+            title="RETRY หลังเติมสต็อก",
+            product_name=product_name,
+            price=actual_price,
+            variant_label=variant_label,
+            quantity=quantity,
+            shop_handle=shop_handle,
+        )
 
 
 # ==================== MAIN FLOW ====================
@@ -1907,14 +2321,32 @@ async def run(config: dict) -> None:
 
         # สร้าง checkout URL
         variant_id_for_url = matched_variant["id"]
-        checkout_url = build_checkout_url(
-            shop_handle=shop_handle,
-            product_id=product_id,
-            variant_id=variant_id_for_url,
-            quantity=quantity,
-            encoding_mode=encoding_mode,
-        )
-        log.info("🔗 Checkout URL: %s", checkout_url)
+
+        # API-first: add-to-cart + mark checkout ผ่าน API → URL ?id={cartId}
+        checkout_url: Optional[str] = None
+        if config.get("use_api_add_to_cart", True):
+            log.info("🚀 ลองเพิ่มลงตะกร้าผ่าน API ก่อน...")
+            checkout_url = await build_checkout_url_via_api(
+                shop_handle=shop_handle,
+                product_id=product_id,
+                variant_id=variant_id_for_url,
+                quantity=quantity,
+                session_file=session_file,
+            )
+            if checkout_url:
+                log.info("✅ API-first สำเร็จ — %s", checkout_url)
+            else:
+                log.warning("⚠️  API-first ไม่สำเร็จ — fallback ไป ?data= URL")
+
+        if not checkout_url:
+            checkout_url = build_checkout_url(
+                shop_handle=shop_handle,
+                product_id=product_id,
+                variant_id=variant_id_for_url,
+                quantity=quantity,
+                encoding_mode=encoding_mode,
+            )
+            log.info("🔗 Checkout URL (?data=): %s", checkout_url)
 
         # ใช้ prewarmed browser หรือเปิดใหม่
         if prewarmed_browser and prewarmed_page:
@@ -1933,7 +2365,7 @@ async def run(config: dict) -> None:
         # ดึงราคา
         actual_price = await extract_price_from_page(page)
 
-        # แสดงสรุป
+               # แสดงสรุป
         print_order_summary(
             title="SHOP MONITOR MODE",
             product_name=new_product["name"],
@@ -1943,11 +2375,33 @@ async def run(config: dict) -> None:
             shop_handle=shop_handle,
         )
 
-        await confirm_place_order(auto_confirm)
-
-        await click_place_order_and_verify(page)
-
-        log.info("✅ เสร็จสิ้น — ปิด browser")
+        # Place Order + รอเติมสต็อกอัตโนมัติถ้าหมด (sold-out popup)
+        final_status = await place_order_with_restock_retry(
+            page,
+            auto_confirm=auto_confirm,
+            product_url=product_url,
+            product_id=product_id,
+            product_name=new_product["name"],
+            shop_handle=shop_handle,
+            variant_id=variant_id_for_url,
+            variant_label=matched_label,
+            quantity=quantity,
+            session_file=session_file,
+            encoding_mode=encoding_mode,
+            use_api_first=bool(config.get("use_api_add_to_cart", True)),
+            check_interval=int(config.get(
+                "restock_wait_interval_seconds",
+                config.get("check_interval_seconds", 30),
+            )),
+            max_stock_checks=int(config.get(
+                "restock_wait_max_checks", max_stock_checks,
+            )),
+            restock_wait_enabled=bool(config.get("restock_wait_enabled", True)),
+        )
+        if final_status == PO_PLACED:
+            log.info("✅ เสร็จสิ้น — ปิด browser")
+        else:
+            log.warning("⚠️  จบด้วยสถานะ: %s — ปิด browser", final_status)
         await browser.close()
         return
 
@@ -1982,6 +2436,10 @@ async def run(config: dict) -> None:
     max_stock_checks: int = int(config.get("max_stock_checks", 120))  # Bug C fix
     auto_confirm: bool = bool(config.get("auto_confirm", False))
 
+    # Auto-Fallback ตามตำแหน่ง: เลื่อนไป option ถัดไปอัตโนมัติเมื่อหมดสต็อก
+    fallback_enabled: bool = bool(config.get("fallback_enabled", True))
+    max_fallback_steps: int = int(config.get("max_fallback_steps", 0))  # 0 = ไม่จำกัด
+
     product_id = parse_product_id(product_url)
     shop_handle = parse_shop_handle(product_url)
 
@@ -1990,6 +2448,13 @@ async def run(config: dict) -> None:
         log.info("🔹 Preferred #1: %s", preferred_1)
     if preferred_2:
         log.info("🔹 Preferred #2: %s", preferred_2)
+    if fallback_enabled:
+        log.info(
+            "🔹 Auto-Fallback: เปิด (เลื่อนสูงสุด %s)",
+            f"{max_fallback_steps} ตำแหน่ง" if max_fallback_steps > 0 else "ไม่จำกัด",
+        )
+    else:
+        log.info("🔹 Auto-Fallback: ปิด — ใช้เฉพาะตำแหน่งที่ระบุ")
 
     # ── ขั้นที่ 1: ดึง product info และ variants ผ่าน HTTP ──
     variants: list[dict] = []
@@ -2037,9 +2502,14 @@ async def run(config: dict) -> None:
 
         # ── stock-check loop พร้อม max_stock_checks ──
         # ใช้ fallback: ถ้าตำแหน่งที่เลือกหมด → เลื่อนไป 2, 3, 4, ... อัตโนมัติ
+        # (ควบคุมได้ด้วย fallback_enabled / max_fallback_steps)
         checks_done = 0
         while checks_done < max_stock_checks:
-            candidate = find_matching_variant_with_fallback(variants, preferred_1, preferred_2)
+            candidate = find_matching_variant_with_fallback(
+                variants, preferred_1, preferred_2,
+                fallback_enabled=fallback_enabled,
+                max_fallback_steps=max_fallback_steps,
+            )
 
             if candidate is None:
                 log.error("❌ ไม่พบ variant ที่ตรงกับ pref1=%s pref2=%s", preferred_1, preferred_2)
@@ -2087,14 +2557,33 @@ async def run(config: dict) -> None:
 
     # ── ขั้นที่ 3: สร้าง Checkout URL ──
     variant_id_for_url = matched_variant["id"]
-    checkout_url = build_checkout_url(
-        shop_handle=shop_handle,
-        product_id=product_id,
-        variant_id=variant_id_for_url,
-        quantity=quantity,
-        encoding_mode=encoding_mode,
-    )
-    log.info("🔗 Checkout URL: %s", checkout_url)
+
+    # API-first: add-to-cart + mark checkout ผ่าน API → URL ?id={cartId}
+    # (เร็วกว่า และหน้า checkout จะโชว์เฉพาะ item ที่เลือก)
+    checkout_url: Optional[str] = None
+    if config.get("use_api_add_to_cart", True):
+        log.info("🚀 ลองเพิ่มลงตะกร้าผ่าน API ก่อน...")
+        checkout_url = await build_checkout_url_via_api(
+            shop_handle=shop_handle,
+            product_id=product_id,
+            variant_id=variant_id_for_url,
+            quantity=quantity,
+            session_file=session_file,
+        )
+        if checkout_url:
+            log.info("✅ API-first สำเร็จ — %s", checkout_url)
+        else:
+            log.warning("⚠️  API-first ไม่สำเร็จ — fallback ไป ?data= URL")
+
+    if not checkout_url:
+        checkout_url = build_checkout_url(
+            shop_handle=shop_handle,
+            product_id=product_id,
+            variant_id=variant_id_for_url,
+            quantity=quantity,
+            encoding_mode=encoding_mode,
+        )
+        log.info("🔗 Checkout URL (?data=): %s", checkout_url)
 
     # ── ขั้นที่ 4: เปิด browser ──
     log.info("🌐 เปิด browser (headless=%s)...", headless)
@@ -2119,12 +2608,33 @@ async def run(config: dict) -> None:
             shop_handle=shop_handle,
         )
 
-        await confirm_place_order(auto_confirm)
-
-        # ── ขั้นที่ 8: Place Order ──
-        await click_place_order_and_verify(page)
-
-        log.info("✅ เสร็จสิ้น — ปิด browser")
+        # ── ขั้นที่ 8: Place Order + รอเติมสต็อกอัตโนมัติถ้าหมด (sold-out popup) ──
+        final_status = await place_order_with_restock_retry(
+            page,
+            auto_confirm=auto_confirm,
+            product_url=product_url,
+            product_id=product_id,
+            product_name=product_info.get("name", ""),
+            shop_handle=shop_handle,
+            variant_id=variant_id_for_url,
+            variant_label=matched_label,
+            quantity=quantity,
+            session_file=session_file,
+            encoding_mode=encoding_mode,
+            use_api_first=bool(config.get("use_api_add_to_cart", True)),
+            check_interval=int(config.get(
+                "restock_wait_interval_seconds",
+                config.get("check_interval_seconds", 30),
+            )),
+            max_stock_checks=int(config.get(
+                "restock_wait_max_checks", max_stock_checks,
+            )),
+            restock_wait_enabled=bool(config.get("restock_wait_enabled", True)),
+        )
+        if final_status == PO_PLACED:
+            log.info("✅ เสร็จสิ้น — ปิด browser")
+        else:
+            log.warning("⚠️  จบด้วยสถานะ: %s — ปิด browser", final_status)
         await browser.close()
 
 

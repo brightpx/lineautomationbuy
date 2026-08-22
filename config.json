@@ -3,12 +3,19 @@
     "session_file": "line_session.json",
     "preferred_1": ["1"],
     "preferred_2": ["1"],
+    "fallback_enabled": true,
+    "max_fallback_steps": 1,
     "quantity": 1,
+    "use_api_add_to_cart": true,
     "checkout_encoding": "auto",
-    "headless": true,
+    "headless": false,
     "auto_confirm": false,
     "check_interval_seconds": 1,
     "max_stock_checks": 120,
+
+    "restock_wait_enabled": true,
+    "restock_wait_interval_seconds": 1,
+    "restock_wait_max_checks": 720,
 
     "_shop_monitor_config": {
         "mode": "shop_monitor",

@@ -12,6 +12,12 @@
 - ตรวจสอบสต็อกอัตโนมัติ
 - รองรับสินค้า 0/1/2 variant options
 
+### 🚀 API-First Checkout (เปิดใช้ default)
+- **เพิ่มลงตะกร้าผ่าน API** (ไม่เปิด browser) — เร็วกว่าเดิมมาก
+- Mark checkout เฉพาะ item ที่เลือก → หน้า checkout **ไม่รวมของอื่นที่ค้างในตะกร้า**
+- ถ้าจำนวนในตะกร้าไม่ตรง → adjust ให้ตรง spec อัตโนมัติ
+- ถ้า API ล้มเหลว → fallback ไป `?data=` URL แบบเดิมอัตโนมัติ
+
 ### 🆕 Shop Monitor Mode (โหมดใหม่)
 - **ตรวจจับสินค้าใหม่** ที่โผล่ในร้านอัตโนมัติ
 - ใช้กับร้านที่ **ซ่อนสินค้าก่อนเปิดขาย**
@@ -78,7 +84,11 @@ python bot.py login
     "auto_confirm": false,
 
     "check_interval_seconds": 1,
-    "max_stock_checks": 120
+    "max_stock_checks": 120,
+
+    "restock_wait_enabled": true,
+    "restock_wait_interval_seconds": 5,
+    "restock_wait_max_checks": 720
 }
 ```
 
@@ -89,8 +99,9 @@ python bot.py login
 2. ดึง variants จาก __NUXT_DATA__
 3. หา variant ที่ตรง preferred_1 + preferred_2
 4. ตรวจสอบสต็อก (รอถ้าหมด)
-5. สร้าง checkout URL
+5. สร้าง checkout URL (API-first → fallback ?data=)
 6. Navigate → เลือก PromptPay → Place Order
+7. ถ้าเจอ popup "สินค้าหมด" → รอเติมสต็อกแล้วยิงซ้ำอัตโนมัติ (ดูด้านล่าง)
 ```
 
 ### รัน
@@ -156,8 +167,9 @@ python checkout_direct.py
 5. เจอ product ใหม่ → ตรวจพบทันที
 6. ดึง variants
 7. เลือก variant แรกที่มีสต็อก
-8. ใช้ prewarmed browser (ถ้าเปิด) หรือเปิดใหม่
-9. Checkout → PromptPay → Place Order
+8. เพิ่มลงตะกร้า + mark checkout ผ่าน API (API-first)
+9. ใช้ prewarmed browser (ถ้าเปิด) หรือเปิดใหม่
+10. Checkout → PromptPay → Place Order
 ```
 
 ### รัน
@@ -210,6 +222,7 @@ python checkout_direct.py
 |-------|------|---------|
 | `session_file` | string | ไฟล์ LINE session | 
 | `quantity` | int | จำนวนที่ต้องการซื้อ |
+| `use_api_add_to_cart` | bool | เพิ่มลงตะกร้าผ่าน API ก่อน (fallback ?data= ถ้าพัง) |
 | `checkout_encoding` | string | `auto` \| `full` \| `quote_only` \| `none` |
 | `headless` | bool | เปิด browser แบบ headless |
 | `auto_confirm` | bool | Place Order โดยไม่ถาม |
@@ -221,8 +234,23 @@ python checkout_direct.py
 | `product_url` | string | URL ของสินค้า |
 | `preferred_1` | array | ตัวเลือกแรก (สี/ไซส์) |
 | `preferred_2` | array | ตัวเลือกสอง (ไซส์/สี) |
+| `fallback_enabled` | bool | เปิด Auto-Fallback ตามตำแหน่ง — หมดสต็อกแล้วเลื่อนไป option ถัดไปอัตโนมัติ (default `true`) |
+| `max_fallback_steps` | int | จำนวนตำแหน่งสูงสุดที่เลื่อนได้จากที่ระบุ (`0` = ไม่จำกัด, default `0`) |
 | `check_interval_seconds` | int | ระยะเวลารอตรวจสต็อก |
 | `max_stock_checks` | int | จำนวนครั้งตรวจสต็อกสูงสุด |
+
+### Restock Wait (ทุกโหมด — รอเติมสต็อกหลัง Place Order เจอ sold-out)
+
+เมื่อกด Place Order แล้วเจอ popup "สินค้าหมด" บอทจะ**ไม่ปิดตัว** แต่:
+1. Poll สต็อกผ่าน HTTP (`__NUXT_DATA__`) ทุก `restock_wait_interval_seconds`
+2. เมื่อ variant กลับมามีของ → เติมลงตะกร้า + mark checkout ใหม่ผ่าน API
+3. เปิด checkout ใหม่บน tab เดิม (session ยังอยู่) → เลือก PromptPay → รอ confirm → กดซ้ำ
+
+| Field | Type | Default | คำอธิบาย |
+|-------|------|---------|---------|
+| `restock_wait_enabled` | bool | `true` | เปิด/ปิดโหมดรอเติมสต็อก (ปิด = จบทันทีเมื่อ sold-out) |
+| `restock_wait_interval_seconds` | int | `check_interval_seconds` | ช่วงห่างการถามสต็อก (วินาที) |
+| `restock_wait_max_checks` | int | `max_stock_checks` | จำนวนครั้งถามสูงสุด (720 × 5s ≈ 1 ชม.) |
 
 ### Shop Monitor Mode เท่านั้น
 
@@ -261,6 +289,28 @@ python checkout_direct.py
 4. ✅ option1 หรือ option2 match pref2 only
 5. ✅ name match pref1 หรือ pref2 อย่างใดอย่างหนึ่ง
 ```
+
+### Auto-Fallback ตามตำแหน่ง (เมื่อหมดสต็อก)
+
+เมื่อ variant ที่เลือกไว้**หมดสต็อก** (`available == 0`) ระบบจะเลื่อนไปตำแหน่งถัดไปของ option อัตโนมัติ:
+
+```
+preferred_1 = ["1"] → ลอง [1] → [2] → [3] → ... ตามลำดับ
+                      └─ เลื่อนได้สูงสุด max_fallback_steps ตำแหน่ง
+
+ลำดับการลอง (pref1="1", pref2="1"):
+  (1,1) → (2,1) → (3,1) → ...   ← ไล่ option1 ก่อน
+  → (1,2) → (2,2) → ...         ← แล้วไล่ option2
+```
+
+| Config | ค่า | พฤติกรรม |
+|--------|-----|----------|
+| `fallback_enabled` | `true` | เลื่อนตำแหน่งอัตโนมัติเมื่อหมด (default) |
+| | `false` | **ไม่เลื่อน** — ใช้เฉพาะตำแหน่งที่ระบุ ถ้าหมดจะรอเติมสต็อกแทน |
+| `max_fallback_steps` | `0` | เลื่อนได้ไม่จำกัด จนถึงตำแหน่งสุดท้าย (default) |
+| | `N` (>0) | เลื่อนได้สูงสุด N ตำแหน่ง เช่น `["1"]` + steps=2 → ลองแค่ [1], [2], [3] |
+
+> 💡 ตัวเลขใน `preferred_1`/`preferred_2` = **ตำแหน่ง** ไม่ใช่ชื่อ option — `"1"` หมายถึง option ตัวแรกที่พบบนหน้าเว็บ
 
 ---
 
