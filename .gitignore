@@ -1,0 +1,24 @@
+# ===== Python =====
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+env/
+
+# ===== Session / credentials (ห้าม commit!) =====
+line_session.json
+*.session.json
+
+# ===== Debug artifacts (screenshots, HTML dumps, JSON dumps) =====
+debug/
+debug_*.png
+debug_*.html
+debug_*.json
+debug_*.txt
+
+# ===== IDE / OS =====
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db

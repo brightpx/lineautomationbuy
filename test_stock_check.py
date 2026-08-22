@@ -4,12 +4,11 @@
 """
 
 import asyncio
-import json
-from pathlib import Path
 from checkout_direct import (
     load_config,
     parse_product_id,
     fetch_variants_via_http,
+    find_matching_variant,
 )
 
 async def test_stock_check():
@@ -20,8 +19,23 @@ async def test_stock_check():
     
     # โหลด config
     config = load_config()
+
+    # ต้องเป็นโหมด Product URL เท่านั้น (shop_monitor ไม่มี product_url)
+    if config.get("mode", "").strip().lower() == "shop_monitor":
+        print("❌ config.json อยู่ในโหมด shop_monitor — ไม่มี product_url")
+        print("   ลบ/เปลี่ยน key 'mode' ใน config.json แล้วรันใหม่")
+        return
+
     product_url = config["product_url"]
-    preferred_sizes = config["preferred_sizes"]
+    # รองรับทั้ง key ใหม่ (preferred_1) และเก่า (preferred_sizes)
+    preferred_sizes = (
+        config.get("preferred_1")
+        or config.get("preferred_sizes")
+        or config.get("size")
+        or []
+    )
+    if isinstance(preferred_sizes, str):
+        preferred_sizes = [preferred_sizes]
     session_file = config.get("session_file", "line_session.json")
     
     product_id = parse_product_id(product_url)
@@ -53,27 +67,24 @@ async def test_stock_check():
     
     print()
     
-    # ทดสอบการหา size ที่เลือก
+    # ทดสอบการหา size ที่เลือก — ใช้ logic เดียวกับบอทจริง
+    # (รองรับทั้งชื่อ option ตรงๆ และตำแหน่ง "1"/"2")
     print("=" * 60)
     print("🎯 ตรวจสอบ size ที่เลือก")
     print("=" * 60)
-    
-    for size in preferred_sizes:
-        matched = None
-        for v in variants:
-            if v["name"].strip().lower() == size.strip().lower():
-                matched = v
-                break
-        
-        if matched:
-            stock = matched.get("available", 0)
-            if stock > 0:
-                print(f"✅ '{size}' → มีสต็อก {stock} ชิ้น (ID: {matched['id']})")
-            else:
-                print(f"❌ '{size}' → หมดสต็อก (available: {stock})")
-                print(f"   ⏳ โปรแกรมจะวนตรวจสอบทุก {config.get('check_interval_seconds', 30)} วินาที")
+
+    matched = find_matching_variant(variants, preferred_sizes, config.get("preferred_2"))
+
+    if matched:
+        stock = matched.get("available", 0)
+        status = "ไม่ทราบ" if stock == -1 else str(stock)
+        if stock != 0:
+            print(f"✅ '{matched['name']}' → มีสต็อก {status} ชิ้น (ID: {matched['id']})")
         else:
-            print(f"❌ '{size}' → ไม่พบใน variants")
+            print(f"❌ '{matched['name']}' → หมดสต็อก (available: {stock})")
+            print(f"   ⏳ โปรแกรมจะวนตรวจสอบทุก {config.get('check_interval_seconds', 30)} วินาที")
+    else:
+        print(f"❌ {preferred_sizes} → ไม่พบ variant ที่ตรง")
     
     print()
     
@@ -101,20 +112,17 @@ async def test_stock_check():
     
     print()
     
-    # ตรวจสอบ logic
-    for size in preferred_sizes:
-        matched = None
-        for v in test_variants:
-            if v["name"].strip().lower() == size.strip().lower():
-                matched = v
-                break
-        
-        if matched:
-            stock = matched.get("available", 0)
-            if stock > 0:
-                print(f"✅ '{size}' → ผ่านเงื่อนไข (มีสต็อก) → ดำเนินการ checkout")
-            else:
-                print(f"❌ '{size}' → ไม่ผ่านเงื่อนไข (หมดสต็อก) → วน loop รอตรวจสอบใหม่")
+    # ตรวจสอบ logic — ใช้ find_matching_variant กับ variants จำลอง (หมดสต็อก)
+    matched = find_matching_variant(test_variants, preferred_sizes, config.get("preferred_2"))
+
+    if matched:
+        stock = matched.get("available", 0)
+        if stock > 0:
+            print(f"✅ '{matched['name']}' → ผ่านเงื่อนไข (มีสต็อก) → ดำเนินการ checkout")
+        else:
+            print(f"❌ '{matched['name']}' → ไม่ผ่านเงื่อนไข (หมดสต็อก) → วน loop รอตรวจสอบใหม่")
+    else:
+        print(f"❌ {preferred_sizes} → ไม่พบ variant ที่ตรง")
     
     print()
     print("=" * 60)
