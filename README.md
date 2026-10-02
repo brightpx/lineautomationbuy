@@ -107,7 +107,18 @@ python bot.py login
 ### รัน
 
 ```bash
+# ล็อกอิน LINE ครั้งแรก (บันทึก session ลง line_session.json)
+python checkout_direct.py --login
+
+# ใช้ product_url จาก config.json
 python checkout_direct.py
+
+# หรือ override URL ผ่าน command line (ไม่ต้องแก้ config.json)
+python checkout_direct.py https://shop.line.me/@thelandofvava/product/1008243987
+python checkout_direct.py --url=https://shop.line.me/@thelandofvava/product/1008243987
+
+# โหมด Shop Monitor (ใช้ค่าจาก _shop_monitor_config ใน config.json)
+python checkout_direct.py --monitor
 ```
 
 ---
@@ -264,10 +275,14 @@ python checkout_direct.py
 | `shop_url` | string | URL ของร้าน |
 | `sale_start_time` | string | เวลาเริ่มขาย `HH:MM:SS` |
 | `check_interval_ms` | int | Polling interval (ms) |
-| `auto_pick_first_product` | bool | เลือกสินค้าแรกอัตโนมัติ |
+| `auto_pick_first_product` | bool | `true` = เลือกสินค้าใหม่แรก/ตัวที่ตรง pattern อัตโนมัติ<br>`false` = ถ้าเจอสินค้าใหม่**หลายชิ้นพร้อมกัน** จะขึ้นเมนูให้เลือก (พร้อม countdown — ไม่เลือกภายในเวลาที่กำหนดจะใช้ default ให้เอง กันพลาดช่วงเปิดขาย) |
+| `product_select_timeout_seconds` | int | เวลา (วินาที) ให้เลือกในเมนูก่อนใช้ default (default `10`) |
 | `auto_pick_first_variant` | bool | เลือก variant แรกอัตโนมัติ |
 | `prewarm_browser` | bool | เปิด browser ล่วงหน้า |
-| `product_name_pattern` | string | Regex filter ชื่อสินค้า |
+| `product_name_pattern` | string | Regex filter ชื่อสินค้า (ตัวที่ตรง pattern จะเป็น default ของเมนู) |
+
+> 💡 การตรวจจับสินค้าใหม่เทียบกับ **baseline** ที่โหลดตอนเริ่ม — สินค้าที่โผล่ทีหลังถือเป็น "ใหม่"
+> ระหว่าง polling กดปุ่มใดก็ได้เพื่อหยุดชั่วคราวแล้วเลือกจากสินค้าทั้งหมดที่มี (arrow keys)
 
 ---
 

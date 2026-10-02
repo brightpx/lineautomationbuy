@@ -1,0 +1,412 @@
+<!DOCTYPE html>
+<html lang="th">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>LINE Buy Bot — Webapp</title>
+<style>
+  :root { --bg:#0f172a; --card:#1e293b; --line:#334155; --txt:#e2e8f0; --dim:#94a3b8;
+          --green:#22c55e; --red:#ef4444; --amber:#f59e0b; --blue:#3b82f6; }
+  * { box-sizing:border-box; margin:0; padding:0; }
+  body { background:var(--bg); color:var(--txt); font-family:"Segoe UI",Tahoma,sans-serif; font-size:14px; }
+  header { display:flex; align-items:center; gap:12px; padding:12px 18px; background:#020617; border-bottom:1px solid var(--line); position:sticky; top:0; z-index:10; }
+  header h1 { font-size:17px; }
+  header .sub { color:var(--dim); font-size:12px; }
+  .badge { padding:4px 12px; border-radius:20px; font-weight:700; font-size:12px; }
+  .idle { background:#334155; } .run { background:var(--green); color:#052e16; animation:blink 1.2s infinite; }
+  @keyframes blink { 50% { opacity:.55; } }
+  #clock { margin-left:auto; color:var(--dim); font-variant-numeric:tabular-nums; }
+  main { display:grid; grid-template-columns:360px 1fr; gap:12px; padding:12px; max-width:1400px; margin:0 auto; }
+  .card { background:var(--card); border:1px solid var(--line); border-radius:10px; padding:14px; margin-bottom:12px; }
+  .card h2 { font-size:14px; margin-bottom:10px; color:#fff; }
+  label { display:block; font-size:12px; color:var(--dim); margin:8px 0 3px; }
+  input, select, textarea { width:100%; background:#0f172a; color:var(--txt); border:1px solid var(--line); border-radius:6px; padding:7px 9px; font-size:13px; }
+  textarea { font-family:Consolas,monospace; font-size:12px; }
+  .row { display:flex; gap:8px; }
+  .row > * { flex:1; }
+  .btns { display:grid; grid-template-columns:1fr 1fr; gap:8px; margin-top:10px; }
+  button { border:0; border-radius:7px; padding:9px; font-weight:700; cursor:pointer; font-size:13px; }
+  .b-prod { background:var(--blue); color:#fff; } .b-mon { background:#8b5cf6; color:#fff; }
+  .b-stop { background:var(--red); color:#fff; } .b-save { background:var(--amber); color:#451a03; }
+  .b-login { background:var(--green); color:#052e16; } .b-ghost { background:#334155; color:var(--txt); }
+  button:disabled { opacity:.45; cursor:not-allowed; }
+  button:hover:not(:disabled) { filter:brightness(1.15); }
+  /* preview */
+  #previewWrap { position:relative; background:#000; border-radius:8px; overflow:hidden; min-height:320px; display:flex; align-items:center; justify-content:center; }
+  #preview { max-width:100%; max-height:62vh; object-fit:contain; }
+  #noPrev { color:var(--dim); padding:40px; text-align:center; }
+  .prevBar { display:flex; gap:8px; align-items:center; margin-top:8px; font-size:12px; color:var(--dim); }
+  .dot { width:9px; height:9px; border-radius:50%; background:var(--red); display:inline-block; }
+  .dot.live { background:var(--green); box-shadow:0 0 6px var(--green); }
+  /* logs */
+  #logs { background:#020617; border:1px solid var(--line); border-radius:8px; height:340px; overflow-y:auto; padding:10px; font-family:Consolas,monospace; font-size:12px; line-height:1.55; }
+  .lv-INFO { color:#cbd5e1; } .lv-WARNING { color:#fbbf24; } .lv-ERROR { color:#f87171; }
+  .lt { color:#475569; margin-right:6px; }
+  .toolbar { display:flex; gap:8px; margin-bottom:8px; align-items:center; }
+  .toolbar small { color:var(--dim); }
+  @media (max-width:900px) { main { grid-template-columns:1fr; } }
+</style>
+</head>
+<body>
+<header>
+  <div><h1>🛒 LINE Buy Bot — Webapp</h1><div class="sub">front + back ใน process เดียว • live preview + logs</div></div>
+  <span id="badge" class="badge idle">IDLE</span>
+  <span id="clock">--:--:--</span>
+</header>
+
+<main>
+  <!-- LEFT -->
+  <section>
+    <div class="card">
+      <h2>🔑 LINE Login <span id="sessBadge" style="color:var(--dim);font-weight:400;font-size:12px"></span></h2>
+      <div id="loginInfo" style="font-size:12px;color:var(--dim);margin-bottom:8px">กำลังเช็ค session…</div>
+      <div class="btns" style="grid-template-columns:1fr 1fr 1fr">
+        <button class="b-login" id="btnLogin">🔑 Login</button>
+        <button class="b-save" id="btnLoginFinish">💾 บันทึก</button>
+        <button class="b-ghost" id="btnLoginCancel">✕ ยกเลิก</button>
+      </div>
+      <div style="font-size:11px;color:var(--dim);margin-top:6px">กด Login → หน้าต่าง Chromium เด้งบนเครื่องที่รัน server → login LINE ให้เสร็จ → กดบันทึก</div>
+    </div>
+    <div class="card">
+      <h2>🎛️ ควบคุมบอท</h2>
+      <label>โหมด</label>
+      <select id="mode">
+        <option value="product">🔵 Product URL (รู้ลิงก์สินค้า)</option>
+        <option value="shop_monitor">🚀 Shop Monitor (ดักสินค้าใหม่)</option>
+      </select>
+      <label>Product URL</label>
+      <input id="product_url" placeholder="https://shop.line.me/@shop/product/...">
+      <div class="row">
+        <div><label>Preferred 1 (เช่น 1)</label><input id="preferred_1" placeholder="1"></div>
+        <div><label>Preferred 2</label><input id="preferred_2" placeholder="1"></div>
+      </div>
+      <div class="row">
+        <div><label>จำนวน</label><input id="quantity" type="number" value="1" min="1"></div>
+        <div><label>เช็คสต็อก (วินาที)</label><input id="check_interval_seconds" type="number" value="1" min="1"></div>
+      </div>
+      <label>Shop URL (โหมด monitor)</label>
+      <input id="shop_url" placeholder="https://shop.line.me/@theshop">
+      <div class="row">
+        <div><label>เวลาเปิดขาย</label><input id="sale_start_time" placeholder="09:59:10"></div>
+        <div><label>Poll (ms)</label><input id="check_interval_ms" type="number" value="500"></div>
+      </div>
+      <div class="row" style="margin-top:8px">
+        <label style="display:flex;gap:6px;align-items:center"><input id="headless" type="checkbox" checked style="width:auto"> headless</label>
+        <label style="display:flex;gap:6px;align-items:center"><input id="auto_confirm" type="checkbox" style="width:auto"> auto_confirm</label>
+      </div>
+      <div class="btns">
+        <button class="b-prod" id="btnStartProd">▶ Start Product</button>
+        <button class="b-mon" id="btnStartMon">🚀 Start Monitor</button>
+        <button class="b-stop" id="btnStop">■ Stop</button>
+        <button class="b-ghost" id="btnReload">↻ โหลด config</button>
+      </div>
+      <div class="btns" style="grid-template-columns:1fr;margin-top:8px">
+        <button class="b-save" id="btnSaveQuick">💾 Save ฟอร์มนี้ลง config</button>
+      </div>
+      <div id="runInfo" style="margin-top:8px;font-size:12px;color:var(--dim)"></div>
+    </div>
+
+    <div class="card">
+      <h2>⚙️ config.json (ขั้นสูง)</h2>
+      <textarea id="rawJson" rows="9" spellcheck="false"></textarea>
+      <div class="btns" style="grid-template-columns:1fr">
+        <button class="b-save" id="btnSave">💾 Save config</button>
+      </div>
+    </div>
+  </section>
+
+  <!-- RIGHT -->
+  <section>
+    <div class="card">
+      <h2>👁️ Preview ความเคลื่อนไหว <span id="liveDot" class="dot"></span> <span id="prevName" style="color:var(--dim);font-weight:400"></span></h2>
+      <div id="previewWrap"><div id="noPrev">ยังไม่มี screenshot<br><small>กด Start แล้วรูป checkout / debug จะโผล่ที่นี่อัตโนมัติ</small></div>
+        <img id="preview" style="display:none" alt="preview">
+      </div>
+      <div id="prevPhase" style="font-size:11px;color:var(--dim);margin-top:6px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis"></div>
+      <div class="prevBar">
+        <label style="display:flex;gap:6px;align-items:center"><input id="previewOn" type="checkbox" checked style="width:auto"> preview</label>
+        <label style="display:flex;gap:6px;align-items:center"><input id="autoPrev" type="checkbox" checked style="width:auto"> auto-refresh 1.5s</label>
+        <select id="pinFile" style="flex:1"><option value="">— ล่าสุดอัตโนมัติ —</option></select>
+        <button class="b-ghost" id="btnShot" style="padding:6px 12px">↻ รีเฟรช</button>
+      </div>
+    </div>
+
+    <div class="card" id="confirmCard" style="display:none;border-color:var(--amber)">
+      <h2>⏳ รอยืนยันสั่งซื้อ <span style="color:var(--dim);font-weight:400;font-size:12px">ตรวจ preview + ราคาก่อนกด</span></h2>
+      <div id="confirmDetail" style="font-size:13px;margin-bottom:10px;line-height:1.7"></div>
+      <div class="btns" style="grid-template-columns:1fr 1fr">
+        <button class="b-login" id="btnConfirmYes">✅ ยืนยันสั่งซื้อ</button>
+        <button class="b-stop" id="btnConfirmNo">✕ ยกเลิก</button>
+      </div>
+    </div>
+
+    <div class="card">
+      <div class="toolbar">
+        <h2 style="margin:0">📜 Live Logs</h2>
+        <small id="wsState">ws: connecting…</small>
+        <span style="flex:1"></span>
+        <button class="b-ghost" id="btnClear" style="padding:5px 12px">ล้างจอ</button>
+        <label style="display:flex;gap:5px;align-items:center;font-size:12px"><input id="autoScroll" type="checkbox" checked style="width:auto"> auto-scroll</label>
+      </div>
+      <div id="logs"></div>
+    </div>
+  </section>
+</main>
+
+<script>
+const $ = id => document.getElementById(id);
+const logsEl = $("logs"), img = $("preview"), noPrev = $("noPrev");
+let pinned = "", lastSrc = "";
+
+// ---------- config ----------
+async function loadConfig() {
+  const r = await fetch("/api/config"); const c = await r.json();
+  $("rawJson").value = JSON.stringify(c, null, 2);
+  $("product_url").value = c.product_url || "";
+  $("quantity").value = c.quantity ?? 1;
+  $("check_interval_seconds").value = c.check_interval_seconds ?? 1;
+  $("headless").checked = !!c.headless; $("auto_confirm").checked = !!c.auto_confirm;
+  $("preferred_1").value = (c.preferred_1||[]).join(",");
+  $("preferred_2").value = (c.preferred_2||[]).join(",");
+  const m = c._shop_monitor_config || {};
+  $("shop_url").value = m.shop_url || c.shop_url || "";
+  $("sale_start_time").value = m.sale_start_time || "";
+  $("check_interval_ms").value = m.check_interval_ms ?? 500;
+}
+function collectOverrides(mode) {
+  const o = { mode, headless: $("headless").checked, auto_confirm: $("auto_confirm").checked,
+    quantity: parseInt($("quantity").value||"1") };
+  if (mode === "product") {
+    o.product_url = $("product_url").value.trim();
+    o.preferred_1 = $("preferred_1").value.split(",").map(s=>s.trim()).filter(Boolean);
+    o.preferred_2 = $("preferred_2").value.split(",").map(s=>s.trim()).filter(Boolean);
+    o.check_interval_seconds = parseInt($("check_interval_seconds").value||"1");
+  } else {
+    o.shop_url = $("shop_url").value.trim();
+    o.sale_start_time = $("sale_start_time").value.trim();
+    o.check_interval_ms = parseInt($("check_interval_ms").value||"500");
+  }
+  return o;
+}
+async function startBot(mode) {
+  const r = await fetch("/api/bot/start", {method:"POST", headers:{"Content-Type":"application/json"},
+    body: JSON.stringify(collectOverrides(mode))});
+  const j = await r.json();
+  if (!j.ok) alert("เริ่มไม่ได้: " + (j.error||"unknown"));
+}
+$("btnStartProd").onclick = () => startBot("product");
+$("btnStartMon").onclick = () => startBot("shop_monitor");
+$("mode").onchange = e => { if (e.target.value === "shop_monitor") startBot("shop_monitor"); };
+$("btnStop").onclick = async () => { await fetch("/api/bot/stop", {method:"POST"}); };
+$("btnReload").onclick = loadConfig;
+$("btnSave").onclick = async () => {
+  try {
+    const obj = JSON.parse($("rawJson").value);
+    await fetch("/api/config", {method:"POST", headers:{"Content-Type":"application/json"}, body: JSON.stringify(obj)});
+    alert("บันทึกแล้ว"); loadConfig();
+  } catch(e) { alert("JSON ผิด: " + e.message); }
+};
+$("btnClear").onclick = () => logsEl.innerHTML = "";
+
+// ---------- save ฟอร์มควบคุมลง config ----------
+function splitList(s){ return String(s||"").split(",").map(x=>x.trim()).filter(Boolean); }
+$("btnSaveQuick").onclick = async () => {
+  const c = await (await fetch("/api/config")).json();
+  const v = id => $(id).value.trim();
+  if (v("product_url")) c.product_url = v("product_url");
+  c.preferred_1 = splitList($("preferred_1").value);
+  c.preferred_2 = splitList($("preferred_2").value);
+  c.quantity = parseInt($("quantity").value) || c.quantity || 1;
+  c.check_interval_seconds = parseInt($("check_interval_seconds").value) || c.check_interval_seconds || 1;
+  c.headless = $("headless").checked;
+  c.auto_confirm = $("auto_confirm").checked;
+  c._shop_monitor_config = c._shop_monitor_config || {};
+  Object.assign(c._shop_monitor_config, {
+    mode: "shop_monitor",
+    shop_url: v("shop_url") || c._shop_monitor_config.shop_url,
+    sale_start_time: v("sale_start_time") || c._shop_monitor_config.sale_start_time,
+    check_interval_ms: parseInt($("check_interval_ms").value) || c._shop_monitor_config.check_interval_ms || 500,
+  });
+  await fetch("/api/config", {method:"POST", headers:{"Content-Type":"application/json"}, body: JSON.stringify(c)});
+  loadConfig();
+  alert("บันทึกฟอร์มลง config.json แล้ว");
+};
+
+// ---------- confirm สั่งซื้อ ----------
+function renderConfirm(d) {
+  const card = $("confirmCard");
+  if (!d) { card.style.display = "none"; return; }
+  card.style.display = "block";
+  $("confirmDetail").innerHTML =
+    `สินค้า: <b>${escapeHtml(d.product_name||"-")}</b><br>` +
+    `ตัวเลือก: <b>${escapeHtml(d.variant_label||"-")}</b> • จำนวน: <b>${d.quantity??"-"}</b>` +
+    (d.price ? ` • ราคา: <b>฿${escapeHtml(d.price)}</b>` : "") +
+    `<br>ร้าน: ${escapeHtml(d.shop_handle||"")} <span style="color:var(--dim)">(${d.since||""})</span>`;
+}
+async function answerConfirm(ok) {
+  const r = await fetch("/api/confirm", {method:"POST", headers:{"Content-Type":"application/json"},
+    body: JSON.stringify({confirm: ok})});
+  if (!r.ok) { const j = await r.json().catch(()=>({})); alert("กดไม่ได้: " + (j.error||r.status)); }
+}
+$("btnConfirmYes").onclick = () => answerConfirm(true);
+$("btnConfirmNo").onclick = () => answerConfirm(false);
+
+// ---------- LINE login ----------
+async function refreshLogin() {
+  try {
+    const j = await (await fetch("/api/login/status")).json();
+    renderLogin(j);
+  } catch(e) {}
+}
+function renderLogin(j) {
+  const lg = j.login || {}, info = $("loginInfo");
+  const sess = j.has_session ? `✅ session: ${j.session_file} (${j.mtime||""})` : "⚠️ ยังไม่มี session — ต้อง login ก่อนรันบอท";
+  $("sessBadge").textContent = j.has_session ? "• " + sess : "";
+  if (lg.active) info.innerHTML = `🟢 หน้าต่าง login เปิดอยู่ (ตั้งแต่ ${lg.started_at||""}) — login ใน browser ให้เสร็จแล้วกด <b>บันทึก</b>`;
+  else info.textContent = sess;
+  $("btnLogin").disabled = !!lg.active;
+  $("btnLoginFinish").disabled = !lg.active;
+  $("btnLoginCancel").disabled = !lg.active;
+}
+$("btnLogin").onclick = async () => {
+  const r = await fetch("/api/login/start", {method:"POST", headers:{"Content-Type":"application/json"}, body:"{}"});
+  const j = await r.json();
+  if (!j.ok && j.error) alert("เปิดไม่ได้: " + j.error);
+  refreshLogin();
+};
+$("btnLoginFinish").onclick = async () => {
+  const r = await fetch("/api/login/finish", {method:"POST"});
+  const j = await r.json();
+  if (!j.ok && j.error) alert("บันทึกไม่ได้: " + j.error);
+  else alert("บันทึก session แล้ว พร้อมรันบอท");
+  refreshLogin();
+};
+$("btnLoginCancel").onclick = async () => { await fetch("/api/login/cancel", {method:"POST"}); refreshLogin(); };
+setInterval(() => { if (!wsOk) refreshLogin(); }, 5000);
+
+// ---------- logs (กันซ้ำด้วย seq) ----------
+let lastSeq = 0;
+function addLogs(arr) {
+  const fresh = (arr || []).filter(l => (l.seq || 0) > lastSeq);
+  if (!fresh.length) return;
+  lastSeq = Math.max(...fresh.map(l => l.seq || 0), lastSeq);
+  for (const l of fresh) {
+    const d = document.createElement("div");
+    d.className = "lv-" + (l.level||"INFO");
+    d.innerHTML = `<span class="lt">${l.t}</span><b>[${l.name}]</b> ${escapeHtml(l.msg)}`;
+    logsEl.appendChild(d);
+    while (logsEl.children.length > 600) logsEl.removeChild(logsEl.firstChild);
+  }
+  if ($("autoScroll").checked) logsEl.scrollTop = logsEl.scrollHeight;
+}
+function escapeHtml(s){ return String(s).replace(/[&<>"]/g, c=>({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;"}[c])); }
+
+// ---------- status + preview ----------
+function setStatus(s) {
+  const b = $("badge"), run = s.running;
+  b.textContent = run ? ("● RUNNING " + (s.mode||"").toUpperCase()) : "IDLE";
+  b.className = "badge " + (run ? "run" : "idle");
+  $("clock").textContent = s.server_time || "";
+  $("runInfo").textContent = run ? `รันอยู่: ${s.detail||s.mode} • เริ่ม ${s.started_at||""}` : (s.finish_note ? ("ล่าสุด: " + s.finish_note) : "พร้อมทำงาน");
+  $("liveDot").className = "dot" + (run ? " live" : "");
+  ["btnStartProd","btnStartMon"].forEach(id => $(id).disabled = run);
+  $("btnStop").disabled = !run;
+  if (s.login || s.has_session !== undefined) renderLogin({login: s.login || {active:false}, has_session: s.has_session, session_file: s.session_file, mtime: s.mtime});
+  renderConfirm(s.confirm || null);
+}
+let lastPrevKey = "", lastChangeAt = Date.now(), shotMtimes = {};
+function lastLogText() {
+  const n = logsEl.children.length;
+  return n ? logsEl.children[n-1].textContent.slice(0, 140) : "";
+}
+function updatePrevLabel(name, mtimeStr) {
+  const age = Math.round((Date.now() - lastChangeAt) / 1000);
+  $("prevName").textContent = `• ${name} @ ${mtimeStr||""}` + (age > 10 ? ` • นิ่งมา ${age}วิ` : " • สด");
+  $("prevPhase").textContent = lastLogText() ? ("ล่าสุด: " + lastLogText()) : "";
+}
+async function refreshPreview() {
+  const pinned = $("pinFile").value;
+  try {
+    // auto: เช็ค mtime ก่อน ดึงรูปเฉพาะตอนไฟล์เปลี่ยน (ประหยัด)
+    if (!pinned) {
+      const info = await (await fetch("/api/preview-info")).json();
+      if (!info.file) { img.style.display = "none"; noPrev.style.display = "block"; $("prevName").textContent = ""; $("prevPhase").textContent = ""; return; }
+      const key = info.file + "@" + info.mtime;
+      if (key === lastPrevKey) { updatePrevLabel(info.file, info.mtime_str); return; }
+      lastPrevKey = key; lastChangeAt = Date.now();
+      const blob = await (await fetch("/api/preview?" + new URLSearchParams({file: info.file, t: Date.now()}))).blob();
+      if (lastSrc) URL.revokeObjectURL(lastSrc); lastSrc = URL.createObjectURL(blob);
+      img.src = lastSrc; img.style.display = "block"; noPrev.style.display = "none";
+      updatePrevLabel(info.file, info.mtime_str);
+      return;
+    }
+    // pinned: เทียบ mtime จากรายการ screenshots
+    const m = shotMtimes[pinned] || 0;
+    const key = pinned + "@" + m;
+    if (key === lastPrevKey && img.style.display !== "none") { updatePrevLabel(pinned, ""); return; }
+    lastPrevKey = key; lastChangeAt = Date.now();
+    const r = await fetch("/api/preview?" + new URLSearchParams({file: pinned, t: Date.now()}));
+    if (!r.ok) return;
+    const blob = await r.blob();
+    if (lastSrc) URL.revokeObjectURL(lastSrc); lastSrc = URL.createObjectURL(blob);
+    img.src = lastSrc; img.style.display = "block"; noPrev.style.display = "none";
+    updatePrevLabel(pinned, "");
+  } catch(e) {}
+}
+async function refreshShotList() {
+  try {
+    const j = await (await fetch("/api/screenshots")).json();
+    const cur = $("pinFile").value;
+    shotMtimes = {};
+    j.files.forEach(f => shotMtimes[f.file] = f.mtime);
+    $("pinFile").innerHTML = '<option value="">— ล่าสุดอัตโนมัติ —</option>' +
+      j.files.map(f => `<option value="${f.file}">${f.file} (${f.mtime_str})</option>`).join("");
+    if (cur) $("pinFile").value = cur;
+  } catch(e) {}
+}
+$("btnShot").onclick = () => { refreshPreview(); refreshShotList(); };
+$("pinFile").onchange = e => refreshPreview();
+function applyPreviewOn() {
+  const on = $("previewOn").checked;
+  try { localStorage.setItem("previewOn", on ? "1" : "0"); } catch(e) {}
+  if (!on) {
+    img.style.display = "none"; noPrev.style.display = "block";
+    noPrev.innerHTML = "ปิด preview อยู่<br><small>ติ๊ก preview เพื่อเปิดดูใหม่</small>";
+    $("prevName").textContent = ""; $("prevPhase").textContent = "";
+  } else {
+    lastPrevKey = "";  // บังคับดึงรูปใหม่รอบถัดไป
+    refreshPreview(); refreshShotList();
+  }
+}
+$("previewOn").onchange = applyPreviewOn;
+try { if (localStorage.getItem("previewOn") === "0") $("previewOn").checked = false; } catch(e) {}
+setInterval(() => { if ($("previewOn").checked && $("autoPrev").checked) refreshPreview(); }, 1500);
+setInterval(() => { if ($("previewOn").checked) refreshShotList(); }, 5000);
+
+// ---------- ws live (fallback polling) ----------
+let wsOk = false;
+function connectWS() {
+  const ws = new WebSocket((location.protocol === "https:" ? "wss://" : "ws://") + location.host + "/ws");
+  ws.onopen = () => { wsOk = true; $("wsState").textContent = "ws: live ●"; };
+  ws.onmessage = ev => {
+    const m = JSON.parse(ev.data);
+    if (m.type === "logs") addLogs(m.logs);
+    if (m.type === "status") setStatus(m.status);
+  };
+  ws.onclose = () => { wsOk = false; $("wsState").textContent = "ws: retry… (polling)"; setTimeout(connectWS, 2000); };
+  ws.onerror = () => ws.close();
+}
+async function pollFallback() {
+  if (wsOk) return;
+  try {
+    const s = await (await fetch("/api/status")).json(); setStatus({...s, server_time: new Date().toLocaleTimeString("th-TH")});
+    const l = await (await fetch("/api/logs?limit=50")).json();
+    // แสดงเฉพาะถ้า ws ตาย (กันซ้ำแบบง่าย: ล้างแล้วเติม)
+  } catch(e) {}
+}
+connectWS(); setInterval(pollFallback, 3000);
+loadConfig(); refreshLogin();
+if ($("previewOn").checked) { refreshPreview(); refreshShotList(); } else { applyPreviewOn(); }
+</script>
+</body>
+</html>

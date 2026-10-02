@@ -26,6 +26,16 @@ from playwright.async_api import async_playwright, Page, Response, TimeoutError 
 if sys.platform == 'win32':
     import msvcrt
 
+# Windows console (cp874) เขียน emoji ไม่ได้ → print/log พังทั้งบอท
+# บังคับ stdout/stderr เป็น UTF-8 + replace ตั้งแต่ import (มีผลทั้ง CLI และ webapp)
+try:
+    if hasattr(sys.stdout, "reconfigure"):
+        sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+    if hasattr(sys.stderr, "reconfigure"):
+        sys.stderr.reconfigure(encoding="utf-8", errors="replace")
+except Exception:
+    pass
+
 # ==================== LOGGING ====================
 logging.basicConfig(
     level=logging.INFO,
@@ -1332,6 +1342,41 @@ def select_first_available_variant(variants: list[dict]) -> Optional[dict]:
     return variants[0]
 
 
+async def choose_new_product_interactively(
+    new_products: list[dict],
+    default_pick: dict,
+    timeout_seconds: int = 10,
+) -> dict:
+    """
+    เมนูเลือกสินค้าเมื่อตรวจพบสินค้าใหม่หลายชิ้นพร้อมกัน
+    - ผู้ใช้ป้อนหมายเลข → ใช้สินค้านั้น
+    - หมดเวลา / ป้อนผิด / Ctrl+C → ใช้ default_pick (ตัวที่ตรง pattern หรือตัวแรก)
+      เพื่อไม่ให้พลาดช่วงเปิดขาย
+    """
+    print("\n🎯 พบสินค้าใหม่หลายชิ้น — เลือกสินค้าที่จะ checkout:")
+    for i, p in enumerate(new_products, 1):
+        marker = "  ← (default)" if p is default_pick else ""
+        print(f"   {i}. [{p['id']}] {p['name']}{marker}")
+    print(f"   ⏱️  ไม่เลือกภายใน {timeout_seconds} วิ → ใช้ '{default_pick['name']}' อัตโนมัติ")
+
+    try:
+        raw = await asyncio.wait_for(
+            asyncio.to_thread(input, f"🎯 เลือกหมายเลข (1-{len(new_products)}): "),
+            timeout=timeout_seconds,
+        )
+        raw = raw.strip()
+        if raw.isdigit() and 1 <= int(raw) <= len(new_products):
+            chosen = new_products[int(raw) - 1]
+            print(f"\033[92m✅ เลือก: [{chosen['id']}] {chosen['name']}\033[0m")
+            return chosen
+        log.warning("⚠️  ป้อน '%s' ไม่ถูกต้อง — ใช้ '%s' แทน", raw, default_pick["name"])
+    except asyncio.TimeoutError:
+        print(f"\n⏱️  หมดเวลา — เลือก '{default_pick['name']}' อัตโนมัติ")
+    except (EOFError, KeyboardInterrupt):
+        print(f"\n⏭️  ข้ามการเลือก — ใช้ '{default_pick['name']}'")
+    return default_pick
+
+
 async def monitor_shop_for_new_products(
     shop_url: str,
     sale_start_time: str,
@@ -1339,6 +1384,8 @@ async def monitor_shop_for_new_products(
     session_file: str,
     product_name_pattern: Optional[str] = None,
     force_polling: bool = False,
+    auto_pick_first_product: bool = True,
+    selection_timeout_seconds: int = 10,
 ) -> dict:
     """
     Monitor ร้านและคืน product ใหม่ที่โผล่ขึ้นมา
@@ -1447,20 +1494,30 @@ async def monitor_shop_for_new_products(
                     for p in new_products:
                         log.info("   • [%d] %s", p["id"], p["name"])
 
-                    # filter ตาม pattern ถ้ามี
+                    # ค่า default: ตัวที่ตรง pattern หรือตัวแรก (พฤติกรรมเดิม)
                     if pattern:
                         filtered = [p for p in new_products if pattern.search(p["name"])]
                         if filtered:
-                            selected = filtered[0]
-                            log.info("✓ เลือกสินค้าที่ตรง pattern: %s", selected["name"])
-                            print(f"\033[93m✓ เลือกสินค้าที่ตรง pattern: {selected['name']}\033[0m")
+                            default_pick = filtered[0]
+                            log.info("✓ ตัวที่ตรง pattern: %s", default_pick["name"])
                         else:
-                            log.warning("⚠️  สินค้าใหม่ไม่ตรงกับ pattern '%s' — เลือกตัวแรก", product_name_pattern)
-                            selected = new_products[0]
+                            log.warning("⚠️  สินค้าใหม่ไม่ตรงกับ pattern '%s'", product_name_pattern)
+                            default_pick = new_products[0]
                     else:
-                        selected = new_products[0]
-                        log.info("✓ เลือกสินค้าแรก: %s", selected["name"])
-                        print(f"\033[93m✓ เลือกสินค้าแรก: {selected['name']}\033[0m")
+                        default_pick = new_products[0]
+
+                    # เจอหลายชิ้นพร้อมกัน + ไม่ได้เปิดโหมด auto-pick → ให้เลือกเอง
+                    # (มี countdown กันพลาดช่วงเปิดขาย — หมดเวลาใช้ default)
+                    if len(new_products) > 1 and not auto_pick_first_product:
+                        selected = await choose_new_product_interactively(
+                            new_products, default_pick,
+                            timeout_seconds=selection_timeout_seconds,
+                        )
+                    else:
+                        selected = default_pick
+                        reason = "ตรง pattern" if pattern and selected is default_pick and pattern.search(selected["name"]) else "แรก"
+                        log.info("✓ เลือกสินค้า%s: %s", reason, selected["name"])
+                        print(f"\033[93m✓ เลือกสินค้า{reason}: {selected['name']}\033[0m")
 
                     print("\n" + "🚀 เริ่ม checkout flow")
                     print(f"   ID: {selected['id']}")
@@ -1911,30 +1968,50 @@ def print_order_summary(
     quantity: int,
     shop_handle: str,
 ) -> None:
-    """แสดงกล่องสรุปก่อน Place Order"""
-    print()
-    print("=" * 60)
+    """แสดงกล่องสรุปก่อน Place Order (กัน console พัง: fallback ascii ถ้า encode ไม่ได้)"""
+    lines = ["", "=" * 60]
     suffix = f" ({title})" if title else ""
-    print(f"📦 พร้อม Place Order{suffix}")
-    print("=" * 60)
+    lines.append(f"📦 พร้อม Place Order{suffix}")
+    lines.append("=" * 60)
     if product_name:
-        print(f"สินค้า : {product_name}")
+        lines.append(f"สินค้า : {product_name}")
     if price:
-        print(f"ราคา   : ฿{price}")
-    print(f"ตัวเลือก: {variant_label}")
-    print(f"จำนวน  : {quantity}")
-    print(f"ร้านค้า : {shop_handle}")
-    print(f"ชำระเงิน: PromptPay")
-    print("=" * 60)
-    print()
+        lines.append(f"ราคา   : ฿{price}")
+    lines.append(f"ตัวเลือก: {variant_label}")
+    lines.append(f"จำนวน  : {quantity}")
+    lines.append(f"ร้านค้า : {shop_handle}")
+    lines.append("ชำระเงิน: PromptPay")
+    lines.append("=" * 60)
+    lines.append("")
+    try:
+        print("\n".join(lines))
+    except UnicodeEncodeError:
+        print("\n".join(lines).encode("utf-8", "replace").decode("ascii", "replace"))
 
 
-async def confirm_place_order(auto_confirm: bool) -> None:
-    """รอผู้ใช้กด Enter ถ้าไม่ได้เปิด auto_confirm"""
-    if not auto_confirm:
+# Webapp ตั้งค่านี้เพื่อรับคำยืนยัน Place Order ผ่านหน้าเว็บแทน terminal:
+#   WEB_CONFIRM_HOOK = async (summary: dict) -> bool   (True=ยืนยัน, False=ยกเลิก)
+# ถ้าเป็น None → ใช้ input() ที่ terminal เหมือนเดิม
+WEB_CONFIRM_HOOK = None
+
+
+async def confirm_place_order(auto_confirm: bool, summary: dict | None = None) -> None:
+    """รอผู้ใช้กด Enter ถ้าไม่ได้เปิด auto_confirm
+    - WEB_CONFIRM_HOOK ถูกตั้ง (รันผ่าน webapp) → รอปุ่มบนเว็บ, กดยกเลิก = CancelledError
+    - ไม่มี terminal (background) → input() โยน EOFError: ถือว่ายืนยันแล้วไปต่อ"""
+    if auto_confirm:
+        return
+    if WEB_CONFIRM_HOOK is not None:
+        ok = await WEB_CONFIRM_HOOK(summary or {})
+        if not ok:
+            raise asyncio.CancelledError("ยกเลิกโดยผู้ใช้บนเว็บ")
+        return
+    try:
         await asyncio.to_thread(
             input, ">>> กด Enter เพื่อ Place Order หรือ Ctrl+C เพื่อยกเลิก: "
         )
+    except EOFError:
+        log.warning("⚠️  ไม่มี terminal ให้กด Enter (รันบนเว็บ/background) — Place Order ต่อทันที")
 
 
 SOLD_OUT_SELECTORS = [
@@ -2173,6 +2250,7 @@ async def place_order_with_restock_retry(
     preferred_2: Optional[list[str]] = None,
     fallback_enabled: bool = False,
     max_fallback_steps: int = 0,
+    price: str = "",
 ) -> str:
     """
     วงจรสั่งซื้อพร้อมรอเติมสต็อก:
@@ -2188,7 +2266,14 @@ async def place_order_with_restock_retry(
     เปลี่ยนถาวรสำหรับรอบถัดๆ ไป)
     """
     while True:
-        await confirm_place_order(auto_confirm)
+        await confirm_place_order(auto_confirm, {
+            "product_name": product_name,
+            "variant_label": variant_label,
+            "quantity": quantity,
+            "shop_handle": shop_handle,
+            "product_url": product_url,
+            "price": price,
+        })
         result = await click_place_order_and_verify(page)
 
         if result != PO_SOLD_OUT:
@@ -2273,6 +2358,8 @@ async def run(config: dict) -> None:
         session_file = config.get("session_file", "line_session.json")
         product_name_pattern = config.get("product_name_pattern")
         force_polling = bool(config.get("force_polling", False))
+        auto_pick_first_product = bool(config.get("auto_pick_first_product", True))
+        product_select_timeout = int(config.get("product_select_timeout_seconds", 10))
         auto_pick_first_variant = config.get("auto_pick_first_variant", True)
         prewarm_browser = config.get("prewarm_browser", False)
         quantity = int(config.get("quantity", 1))
@@ -2329,6 +2416,8 @@ async def run(config: dict) -> None:
             session_file=session_file,
             product_name_pattern=product_name_pattern,
             force_polling=force_polling,
+            auto_pick_first_product=auto_pick_first_product,
+            selection_timeout_seconds=product_select_timeout,
         )
 
         product_url = new_product["url"]
@@ -2448,13 +2537,15 @@ async def run(config: dict) -> None:
                 config.get("check_interval_seconds", 30),
             )),
             max_stock_checks=int(config.get(
-                "restock_wait_max_checks", max_stock_checks,
+                "restock_wait_max_checks",
+                config.get("max_stock_checks", 120),
             )),
             restock_wait_enabled=bool(config.get("restock_wait_enabled", True)),
             preferred_1=config.get("preferred_1"),
             preferred_2=config.get("preferred_2"),
             fallback_enabled=bool(config.get("fallback_enabled", True)),
             max_fallback_steps=int(config.get("max_fallback_steps", 0)),
+            price=actual_price,
         )
         if final_status == PO_PLACED:
             log.info("✅ เสร็จสิ้น — ปิด browser")
@@ -2692,6 +2783,7 @@ async def run(config: dict) -> None:
             preferred_2=preferred_2,
             fallback_enabled=fallback_enabled,
             max_fallback_steps=max_fallback_steps,
+            price=actual_price or product_info.get("price", ""),
         )
         if final_status == PO_PLACED:
             log.info("✅ เสร็จสิ้น — ปิด browser")
@@ -2700,9 +2792,78 @@ async def run(config: dict) -> None:
         await browser.close()
 
 
+async def do_login_flow(session_file: str) -> None:
+    """เปิด browser ให้ล็อกอิน LINE ด้วยมือ แล้วบันทึก session ลงไฟล์"""
+    from playwright.async_api import async_playwright
+
+    log.info("=" * 60)
+    log.info("🔑 โหมดล็อกอิน — กำลังเปิด browser...")
+    log.info("   1) ล็อกอินด้วย LINE account ในหน้าต่างที่เปิดขึ้น")
+    log.info("   2) เมื่อล็อกอินเสร็จ กลับมาที่ terminal แล้วกด Enter")
+    log.info("=" * 60)
+
+    async with async_playwright() as pw:
+        browser = await pw.chromium.launch(headless=False)
+        context = await browser.new_context()
+        page = await context.new_page()
+        await page.goto("https://shop.line.me/", wait_until="domcontentloaded")
+
+        await asyncio.get_event_loop().run_in_executor(
+            None, input, ">>> กด Enter เมื่อล็อกอินเสร็จแล้ว: "
+        )
+
+        storage = await context.storage_state()
+        Path(session_file).write_text(json.dumps(storage), encoding="utf-8")
+        log.info("✅ บันทึก session ลง %s แล้ว — ปิด browser", session_file)
+        await browser.close()
+
+
 async def main() -> None:
     config = load_config()
     log.info("โหลด config จาก %s", CONFIG_FILE)
+
+    args = [a for a in sys.argv[1:] if a]
+
+    # ── --login: เปิด browser ให้ล็อกอิน LINE แล้วบันทึก session ──
+    #    python checkout_direct.py --login
+    if "--login" in args:
+        args.remove("--login")
+        session_file = config.get("session_file", "line_session.json")
+        await do_login_flow(session_file)
+        return
+
+    # ── --monitor: สลับไป Shop Monitor Mode โดยใช้ค่าจาก _shop_monitor_config ──
+    #    python checkout_direct.py --monitor
+    if "--monitor" in args:
+        args.remove("--monitor")
+        monitor_cfg = config.get("_shop_monitor_config")
+        if not isinstance(monitor_cfg, dict) or not monitor_cfg:
+            log.error("❌ ไม่พบ _shop_monitor_config ใน %s", CONFIG_FILE)
+            sys.exit(2)
+        merged = {**config, **monitor_cfg}
+        merged["mode"] = "shop_monitor"
+        merged.pop("_shop_monitor_config", None)
+        config = merged
+        log.info("🔵 สลับเป็น SHOP MONITOR MODE (--monitor)")
+
+    # ── CLI override: python checkout_direct.py <product_url> ──
+    #    ใช้ URL จาก command line ทับ product_url ใน config.json
+    #    (มีประโยชน์ตอนรอสต็อกแล้วอยากสลับไปลิงก์อื่นทันที ไม่ต้องแก้ config)
+    for a in args:
+        if a.startswith("--url="):
+            args.remove(a)
+            args.insert(0, a[len("--url="):])
+            break
+    if args and config.get("mode") != "shop_monitor":
+        url_override = args[0]
+        if not url_override.startswith("http"):
+            log.error("❌ URL ไม่ถูกต้อง: %s (ต้องขึ้นต้นด้วย http/https)", url_override)
+            sys.exit(2)
+        old_url = config.get("product_url")
+        config["product_url"] = url_override
+        log.info("🔗 Override product_url จาก CLI: %s → %s",
+                 old_url, url_override)
+
     await run(config)
 
 

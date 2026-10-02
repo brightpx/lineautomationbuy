@@ -1,8 +1,12 @@
 {
-    "product_url": "https://shop.line.me/@thelandofvava/product/1008243987",
+    "product_url": "https://shop.line.me/@thelandofvava/product/1007383921",
     "session_file": "line_session.json",
-    "preferred_1": ["1"],
-    "preferred_2": ["1"],
+    "preferred_1": [
+        "1"
+    ],
+    "preferred_2": [
+        "1"
+    ],
     "fallback_enabled": true,
     "max_fallback_steps": 0,
     "quantity": 1,
@@ -12,11 +16,9 @@
     "auto_confirm": false,
     "check_interval_seconds": 1,
     "max_stock_checks": 120,
-
     "restock_wait_enabled": true,
     "restock_wait_interval_seconds": 1,
     "restock_wait_max_checks": 720,
-
     "_shop_monitor_config": {
         "mode": "shop_monitor",
         "shop_url": "https://shop.line.me/@thelandofvava",
